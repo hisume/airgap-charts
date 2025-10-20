@@ -167,6 +167,9 @@ CLI Arguments (detailed)
   Docker Hub username for authenticated pulls (optional).
 - --dockerhub-token / env DOCKERHUB_TOKEN
   Docker Hub access token (or password) for the username (optional).
+- --only-addon <NAME[,NAME2,...]>
+  In values mode, only process addons whose chart exactly matches one of the provided names (case-insensitive).
+  Examples: --only-addon karpenter  or  --only-addon karpenter,aws-load-balancer-controller
 
 Environment Variables (optional)
 - ECR_PUBLIC_PASSWORD
@@ -231,6 +234,11 @@ python main.py --values ./values.yaml --push-images \
 - Scan-only (no pushes), write overrides for inspection:
 ```
 python main.py --values ./values.yaml --scan-only --include-dependencies
+```
+- Only process specific addon(s) by chart name:
+```
+python main.py --values ./values.yaml --push-images --only-addon karpenter
+python main.py --values ./values.yaml --push-images --only-addon karpenter,aws-load-balancer-controller
 ```
 - AppSet mode (legacy):
 ```

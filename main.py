@@ -183,6 +183,17 @@ def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest
             return
 
         logger.info(f"Discovered {len(addons)} addons in {values_path}")
+        # Optional filter to process only specific addons by exact chart name
+        if getattr(args, "only_addon", None):
+            selectors = {s.strip().lower() for s in str(args.only_addon).split(",") if s.strip()}
+            if selectors:
+                before = len(addons)
+                addons = [a for a in addons if (a.get("chart") or "").strip().lower() in selectors]
+                selected_names = ", ".join([a.get("chart") or "" for a in addons])
+                logger.info(f"Selected {len(addons)}/{before} addons via --only-addon: {selected_names}")
+                if not addons:
+                    logger.warning("No addons matched --only-addon filter; exiting.")
+                    return
         for spec in addons:
             helm_chart = HelmChart(
                 addon_chart=spec.get('chart'),
@@ -251,5 +262,7 @@ if __name__ == "__main__":
     # Docker Hub auth (optional; increases rate limits and allows private pulls)
     parser.add_argument('--dockerhub-username', required=False, help='Docker Hub username for authenticated pulls (or set DOCKERHUB_USERNAME)')
     parser.add_argument('--dockerhub-token', required=False, help='Docker Hub access token/password for the username (or set DOCKERHUB_TOKEN)')
+    # Only process specific addons by exact chart name (comma-separated, case-insensitive), values mode only
+    parser.add_argument('--only-addon', required=False, help='Comma-separated chart names to process (exact match on chart, case-insensitive)')
     args = parser.parse_args()
     main(args.appspec, args.scan_only, args.push_images, args.latest, args.values)

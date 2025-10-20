@@ -8,6 +8,7 @@ from ruamel.yaml import YAML
 import json
 from pathlib import Path
 import time
+import shutil
 from urllib.parse import urlparse
 from colorama import Fore, Style, init as colorama_init
 
@@ -307,6 +308,39 @@ class HelmChart:
         except Exception:
             return None
 
+    def _get_local_image_id(self, ref: str) -> str | None:
+        """
+        Return the local image ID (sha256:...) for a given image reference.
+        """
+        try:
+            out = self.run_docker(["docker", "inspect", "--format", "{{.Id}}", ref], f"Failed to get image ID for {ref}")
+            if out is None:
+                return None
+            image_id = (out or "").strip()
+            return image_id or None
+        except Exception:
+            return None
+
+    def _get_repo_digests(self, ref: str) -> list[str] | None:
+        """
+        Return the list of repo digests (e.g., ['registry/repo@sha256:...']) for a given image reference.
+        """
+        try:
+            out = self.run_docker(["docker", "inspect", "--format", "{{json .RepoDigests}}", ref], f"Failed to get repo digests for {ref}")
+            if out is None:
+                return None
+            out = out.strip()
+            if not out:
+                return None
+            # Expecting a JSON array; eval safely
+            import json as _json
+            digests = _json.loads(out)
+            if isinstance(digests, list):
+                return digests
+            return None
+        except Exception:
+            return None
+
     def _docker_pull(self, image: str, platform: str | None = None) -> bool:
         """
         Pull an image, optionally specifying a platform.
@@ -339,6 +373,89 @@ class HelmChart:
                     # continue to next platform
                     continue
         return False
+
+    def _recover_push_no_platform(self, public_repo: str, private_image: str) -> bool:
+        """
+        Recover from 'does not provide any platform' push failures by re-pulling the source
+        image with an explicit platform and retrying the tag/push. Defaults to linux/amd64
+        when platform preference is 'auto'.
+        """
+        pref = getattr(self, "platform", "auto")
+        plat = "linux/amd64" if pref == "auto" else pref
+        logger.warning(f"Push failed due to missing platform; defaulting to {plat} for {public_repo}")
+        # Best-effort cleanup of local references that might point at manifest lists
+        try:
+            self.run_docker(["docker", "image", "rm", "-f", private_image], f"Cleanup local tag {private_image}")
+        except Exception:
+            pass
+        try:
+            self.run_docker(["docker", "image", "rm", "-f", public_repo], f"Cleanup local source {public_repo}")
+        except Exception:
+            pass
+        # Pull with explicit platform, re-tag, and retry push
+        if not self._docker_pull(public_repo, plat):
+            return False
+        # Prefer digest-based retagging to avoid manifest-list ambiguity
+        digests = self._get_repo_digests(public_repo) or []
+        digest_ref = None
+        for d in digests:
+            # Expect strings like 'public.ecr.aws/...@sha256:abc'
+            if "@sha256:" in d:
+                digest_ref = d
+                break
+        if digest_ref:
+            logger.info(f"Retagging from {digest_ref} -> {private_image}")
+            tag_ok = self.run_docker(["docker", "tag", digest_ref, private_image], f"Failed to tag {digest_ref} -> {private_image}") is not None
+            if not tag_ok:
+                return False
+        else:
+            image_id = self._get_local_image_id(public_repo)
+            if not image_id:
+                return False
+            logger.info(f"Retagging from {image_id} -> {private_image}")
+            tag_ok = self.run_docker(["docker", "tag", image_id, private_image], f"Failed to tag {image_id} -> {private_image}") is not None
+            if not tag_ok:
+                return False
+        push_ok = self.run_docker(["docker", "push", private_image], f"Failed to push after explicit platform {plat}: {private_image}") is not None
+        if push_ok:
+            return True
+        # Save/Load fallback to force a single-arch local artifact
+        try:
+            tar_path = os.path.join(self.docker_config_dir or ".docker-sandbox", self.addon_chart, "tmp-image.tar")
+            os.makedirs(os.path.dirname(tar_path), exist_ok=True)
+            src_ref = digest_ref if digest_ref else (image_id or public_repo)
+            logger.warning(f"Push still failing; attempting save/load fallback using {src_ref}")
+            # Best-effort cleanup of the private tag
+            try:
+                self.run_docker(["docker", "image", "rm", "-f", private_image], f"Cleanup local tag {private_image}")
+            except Exception:
+                pass
+            # Save and reload the image
+            if self.run_docker(["docker", "save", "-o", tar_path, src_ref], f"Failed to save image {src_ref}") is None:
+                return False
+            if self.run_docker(["docker", "load", "-i", tar_path], f"Failed to load image from tar {tar_path}") is None:
+                return False
+            # Tag from digest or loaded ID again
+            loaded_id = self._get_local_image_id(src_ref) or image_id
+            if loaded_id:
+                logger.info(f"Retagging (post-load) from {loaded_id} -> {private_image}")
+                if self.run_docker(["docker", "tag", loaded_id, private_image], f"Failed to tag {loaded_id} -> {private_image}") is None:
+                    return False
+            elif digest_ref:
+                logger.info(f"Retagging (post-load) from {digest_ref} -> {private_image}")
+                if self.run_docker(["docker", "tag", digest_ref, private_image], f"Failed to tag {digest_ref} -> {private_image}") is None:
+                    return False
+            else:
+                return False
+            # Retry push
+            push_ok2 = self.run_docker(["docker", "push", private_image], f"Failed to push after save/load fallback: {private_image}") is not None
+            return push_ok2
+        finally:
+            try:
+                if os.path.exists(tar_path):
+                    os.remove(tar_path)
+            except Exception:
+                pass
 
     def _normalize_image_host(self, image: str) -> str:
         """
@@ -782,52 +899,14 @@ class HelmChart:
                         self._login_ecr_public_chart()
                     except Exception as e:
                         logger.warning(f"Helm registry login to public ECR for dependencies failed: {e}")
+                # Log any OCI dependency hosts for visibility
+                oci_hosts = [(d.get("repository") or "") for d in decls_for_login if (d.get("repository") or "").startswith("oci://")]
+                if oci_hosts:
+                    logger.info(f"Detected OCI dependencies: {', '.join(oci_hosts)}")
                 # Use sandboxed helm with OCI enabled for dependency operations
                 dep_build_out = self.run_helm(["dependency", "build", chart_root], "Failed to build chart dependencies")
                 if dep_build_out is None:
-                    logger.warning("Dependency build failed; attempting 'helm dependency update' then rebuild")
-                    self.run_helm(["dependency", "update", chart_root], "Failed to update chart dependencies")
-                    dep_build_out2 = self.run_helm(["dependency", "build", chart_root], "Failed to build chart dependencies after update")
-                    if dep_build_out2 is None:
-                        # Force repair: remove Chart.lock and charts/ then update+build again
-                        lock_path = os.path.join(chart_root, "Chart.lock")
-                        charts_dir = os.path.join(chart_root, "charts")
-                        try:
-                            if os.path.exists(lock_path):
-                                os.remove(lock_path)
-                                logger.warning(f"Removed stale lock file: {lock_path}")
-                        except Exception as e:
-                            logger.warning(f"Unable to remove Chart.lock: {e}")
-                        try:
-                            if os.path.isdir(charts_dir):
-                                # Remove vendored charts directory to allow a clean rebuild
-                                for entry in os.listdir(charts_dir):
-                                    sub = os.path.join(charts_dir, entry)
-                                    if os.path.isdir(sub):
-                                        for root, dirs, files in os.walk(sub, topdown=False):
-                                            for name in files:
-                                                try:
-                                                    os.remove(os.path.join(root, name))
-                                                except Exception:
-                                                    pass
-                                            for name in dirs:
-                                                try:
-                                                    os.rmdir(os.path.join(root, name))
-                                                except Exception:
-                                                    pass
-                                        try:
-                                            os.rmdir(sub)
-                                        except Exception:
-                                            pass
-                                try:
-                                    os.rmdir(charts_dir)
-                                except Exception:
-                                    pass
-                                logger.warning(f"Removed vendored charts directory: {charts_dir}")
-                        except Exception as e:
-                            logger.warning(f"Unable to remove charts directory: {e}")
-                        self.run_helm(["dependency", "update", chart_root], "Failed to update chart dependencies after repair")
-                        self.run_helm(["dependency", "build", chart_root], "Failed to build chart dependencies after repair")
+                    logger.warning("Dependency build failed; skipping vendored subcharts and relying on --dependency-update during template")
                 # Enable any conditional dependencies explicitly
                 declared = self._collect_declared_dependencies(chart_root)
                 for dep in declared:
@@ -855,9 +934,10 @@ class HelmChart:
             if self.addon_chart == "karpenter":
                 set_args += ["--set-string", "settings.clusterName=placeholder", "--set-string", "settings.clusterEndpoint=https://placeholder"]
 
-            # Run helm template without arbitrary --set values that might break strict schemas
-            cmd_get_images = ["helm", "template", str(template_target)] + set_args
-            helm_output = self.run_command(cmd_get_images, "Failed to get images")
+            # Run helm template using sandboxed helm and enable dependency update to cope with stale locks
+            cmd_get_images = ["helm", "template", "--dependency-update", str(template_target)] + set_args
+            args_template = cmd_get_images[1:]
+            helm_output = self.run_helm(args_template, "Failed to get images")
 
             # If template failed due to required values, retry with minimal per-chart overrides
             if helm_output is None:
@@ -868,8 +948,9 @@ class HelmChart:
                     override_flags += ["--set-string", "clusterName=placeholder"]
                 if override_flags:
                     logger.info(f"Retrying helm template with minimal overrides for {self.addon_chart}")
-                    cmd_get_images_override = ["helm", "template", str(template_target)] + set_args + override_flags
-                    helm_output = self.run_command(cmd_get_images_override, "Failed to get images with overrides")
+                    cmd_get_images_override = ["helm", "template", "--dependency-update", str(template_target)] + set_args + override_flags
+                    args_template_override = cmd_get_images_override[1:]
+                    helm_output = self.run_helm(args_template_override, "Failed to get images with overrides")
             
             if not helm_output:
                 raise Exception(f"Helm template produced no output for {self.addon_chart}; cannot extract images")
@@ -989,10 +1070,50 @@ class HelmChart:
                 logger.info(f"Tagging Image for Private ECR (platform={effective})")
                 docker_tag = ["docker", "tag", public_repo, private_image]
                 self.run_docker(docker_tag, f"Failed to tag image {public_repo} to {private_image}")
+                # Verify the private tag resolves to a concrete platform; if not, normalize now
+                priv_effective = self._docker_inspect_platform(private_image)
+                if not priv_effective:
+                    pref = getattr(self, "platform", "auto")
+                    plat = "linux/amd64" if pref == "auto" else pref
+                    logger.warning(f"Private tag {private_image} lacks platform; re-pulling {public_repo} with {plat} and re-tagging")
+                    # Best-effort cleanup to avoid cached manifest lists
+                    try:
+                        self.run_docker(["docker", "image", "rm", "-f", private_image], f"Cleanup local tag {private_image}")
+                    except Exception:
+                        pass
+                    try:
+                        self.run_docker(["docker", "image", "rm", "-f", public_repo], f"Cleanup local source {public_repo}")
+                    except Exception:
+                        pass
+                    if self._docker_pull(public_repo, plat):
+                        # Prefer digest-based retagging
+                        digests = self._get_repo_digests(public_repo) or []
+                        digest_ref = None
+                        for d in digests:
+                            if "@sha256:" in d:
+                                digest_ref = d
+                                break
+                        if digest_ref:
+                            logger.info(f"Retagging from {digest_ref} -> {private_image}")
+                            self.run_docker(["docker", "tag", digest_ref, private_image], f"Failed to tag {digest_ref} -> {private_image}")
+                        else:
+                            image_id = self._get_local_image_id(public_repo)
+                            if image_id:
+                                logger.info(f"Retagging from {image_id} -> {private_image}")
+                                self.run_docker(["docker", "tag", image_id, private_image], f"Failed to tag {image_id} -> {private_image}")
+                            else:
+                                logger.warning(f"Unable to resolve digest or image ID for {public_repo} after explicit pull; push may still fail")
+                    else:
+                        logger.warning(f"Re-pull with explicit platform {plat} failed for {public_repo}; push may still fail")
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to tag image {public_repo} to {private_image}: {e}")
                 raise e
 
+            # Diagnostics before push
+            pub_plat = self._docker_inspect_platform(public_repo)
+            priv_plat = self._docker_inspect_platform(private_image)
+            pub_digests = self._get_repo_digests(public_repo) or []
+            logger.info(f"Pre-push inspect: src={public_repo} platform={pub_plat}, digests={pub_digests} -> dst={private_image} platform={priv_plat}")
             try:
                 ecr_repo = image_with_repo_path.split(':')[0]
                 self.ecr_client.describe_repositories(repositoryNames=[ecr_repo])
@@ -1009,6 +1130,7 @@ class HelmChart:
 
             self.authenticate_ecr(is_public=False)
             logger.info(f"Pushing image to private ECR: {private_image}")
+            attempted_recovery = False
             for attempt in range(retry_count):
                 try:
                     push_command = ["docker", "push", private_image]
@@ -1017,11 +1139,40 @@ class HelmChart:
                         logger.info(f"Successfully pushed {public_repo} to {private_image}.")
                         break
                     else:
+                        # First, attempt a one-time explicit-platform recovery regardless of current inspect results.
+                        if not attempted_recovery:
+                            logger.warning(f"Push failed for {private_image}; attempting explicit platform recovery")
+                            if self._recover_push_no_platform(public_repo, private_image):
+                                logger.info(f"Successfully pushed {public_repo} to {private_image} after platform recovery.")
+                                break
+                            attempted_recovery = True
+                        # If push failed, check if either source or private tag lacks a concrete platform and recover.
+                        eff_pub = self._docker_inspect_platform(public_repo)
+                        eff_priv = self._docker_inspect_platform(private_image)
+                        if not eff_pub or not eff_priv:
+                            # Attempt recovery: default to linux/amd64 (or explicit platform) and retry once
+                            if self._recover_push_no_platform(public_repo, private_image):
+                                logger.info(f"Successfully pushed {public_repo} to {private_image} after platform recovery.")
+                                break
                         logger.warning(f"Attempt {attempt + 1} failed to push image {public_repo} to {private_image}")
                         if attempt + 1 < retry_count:
                             logger.info(f"Retrying in {retry_delay} seconds...")
                             time.sleep(retry_delay)
                         else:
+                            # Final fallback: remove remote tag and retry once with explicit-platform recovery
+                            try:
+                                # Derive repo name and tag for ECR delete
+                                repo_no_tag = image_with_repo_path.split(":")[0]
+                                image_tag = image_name.split(":")[1] if ":" in image_name else None
+                                if image_tag:
+                                    logger.warning(f"Deleting remote tag {repo_no_tag}:{image_tag} from ECR before final retry")
+                                    self.ecr_client.batch_delete_image(repositoryName=repo_no_tag, imageIds=[{"imageTag": image_tag}])
+                            except Exception as e_del:
+                                logger.warning(f"Unable to delete remote tag before final retry: {e_del}")
+                            # Attempt one last explicit-platform recovery and push
+                            if self._recover_push_no_platform(public_repo, private_image):
+                                logger.info(f"Successfully pushed {public_repo} to {private_image} after remote cleanup recovery.")
+                                break
                             logger.error(f"Maximum attempts reached for pushing image {public_repo} to {private_image}.")
                             self.failed_push_addon_chart_images.append(private_image)
                 except Exception as e:

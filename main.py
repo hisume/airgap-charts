@@ -8,6 +8,7 @@ from yamls import get_yaml_files, extract_values, copy_and_update_yaml
 from image_yaml import extract_chart_values_image, convert_dict_to_yaml
 from chart import HelmChart, configure_colored_logging, set_log_context, clear_log_context
 from values_parser import discover_addons_in_values
+from colorama import Fore, Style
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,19 +43,20 @@ def process_helm_chart(helm_chart: HelmChart, downloaded_chart_folder: str, scan
         if remote_version is None:
             logger.error(f"Failed to get the version for {helm_chart.addon_chart}")
             clear_log_context()
-            return None
+            return None, f"Failed to get version for {helm_chart.addon_chart}"
         else:
             logger.info(f"Using version {remote_version} for {helm_chart.addon_chart}")
     except Exception as e:
         logger.error(f"Failed to get the version for {helm_chart.addon_chart}: {e}")
         clear_log_context()
-        return None
+        return None, str(e)
 
     try:
         chart_file = helm_chart.download_chart(downloaded_chart_folder, remote_version)
         if not chart_file:
-            logger.error(f"Failed to download chart for {helm_chart.addon_chart}")
-            return None
+            msg = f"Failed to download chart for {helm_chart.addon_chart}"
+            logger.error(msg)
+            return helm_chart, msg
 
         logger.info(f"Chart downloaded to: {chart_file}")
         helm_chart.get_private_ecr_url()
@@ -93,14 +95,24 @@ def process_helm_chart(helm_chart: HelmChart, downloaded_chart_folder: str, scan
             copy_and_update_yaml(yaml_file, new_appspec_folder, base_appspec_folder, new_version=helm_chart.addon_chart_version, private_ecr_url=helm_chart.private_ecr_url)
             logger.info(f"Updated YAML file copied to: {new_appspec_folder}")
 
-        logger.info(f"Finalised the process\n CHART INFO:\n{helm_chart}\n END!\n")
+        # Build summary status
+        error_msgs = []
+        if helm_chart.failed_pull_addon_chart_images:
+            error_msgs.append(f"Failed pulls: {helm_chart.failed_pull_addon_chart_images}")
+        if helm_chart.failed_push_addon_chart_images:
+            error_msgs.append(f"Failed pushes: {helm_chart.failed_push_addon_chart_images}")
+        if helm_chart.failed_commands:
+            last_cmd = helm_chart.failed_commands[-1] if helm_chart.failed_commands else None
+            if last_cmd:
+                error_msgs.append(f"Cmd error: {last_cmd[1]} -> {str(last_cmd[2])[:200]}")
+        error_text = "; ".join(error_msgs) if error_msgs else ""
         # Clear context before returning
         clear_log_context()
-        return helm_chart
+        return helm_chart, (error_text or None)
     except Exception as e:
         logger.error(f"Failed to download or push chart: {e}")
         clear_log_context()
-        return None
+        return None, str(e)
 
 def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest: bool = False, values_path: Optional[str] = None):
     """
@@ -112,6 +124,7 @@ def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest
     downloaded_chart_folder = './helm-charts'
     new_appspec_folder = './airgaped-application-sets'
     processed_charts = []
+    summaries = []
 
     # Determine push behavior and verify dependencies upfront
     will_push = push_images or (not scan_only and not push_images)
@@ -168,7 +181,21 @@ def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest
                 include_dependencies=args.include_dependencies,
             )
             if result:
-                processed_charts.append(result)
+                hc, err = result
+                if hc:
+                    processed_charts.append(hc)
+                    summaries.append({
+                        "name": hc.addon_chart,
+                        "version": hc.addon_chart_version,
+                        "error": err or ""
+                    })
+                else:
+                    # If no chart object, synthesize minimal summary
+                    summaries.append({
+                        "name": chart_info.addon_chart if 'chart_info' in locals() and chart_info else (appspec_name or "unknown"),
+                        "version": chart_info.addon_chart_version if 'chart_info' in locals() and chart_info else "",
+                        "error": err or "unknown error"
+                    })
 
     elif values_mode:
         logger.info(f"Parsing addons from values file: {values_path}")
@@ -230,15 +257,36 @@ def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest
                 include_dependencies=args.include_dependencies,
             )
             if result:
-                processed_charts.append(result)
+                hc, err = result
+                if hc:
+                    processed_charts.append(hc)
+                    summaries.append({
+                        "name": hc.addon_chart,
+                        "version": hc.addon_chart_version,
+                        "error": err or ""
+                    })
+                else:
+                    summaries.append({
+                        "name": spec.get('chart') or "unknown",
+                        "version": spec.get('version') or "",
+                        "error": err or "unknown error"
+                    })
     else:
         logger.error("No valid mode selected. Provide --appspec to process a specific appspec from application-sets "
                      "or supply --values pointing to a values.yaml file containing multiple addons.")
         return
 
-    # Summary
-    for chart in processed_charts:
-        logger.info(chart)
+    # Summary (name, version, status in green/red, error text if any)
+    if summaries:
+        logger.info("Summary:")
+    for s in summaries:
+        name = s.get("name") or "unknown"
+        version = s.get("version") or ""
+        err = (s.get("error") or "").strip()
+        if not err:
+            logger.info(f"{Fore.GREEN}SUCCESS{Style.RESET_ALL} {name} v{version}")
+        else:
+            logger.error(f"{Fore.RED}ERROR{Style.RESET_ALL} {name} v{version} - {err}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process Helm charts and update them with new versions and image repositories.')

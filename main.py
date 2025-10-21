@@ -4,7 +4,6 @@ import os
 import sys
 import shutil
 from typing import Optional
-from yamls import get_yaml_files, extract_values, copy_and_update_yaml
 from image_yaml import extract_chart_values_image, convert_dict_to_yaml
 from chart import HelmChart, configure_colored_logging, set_log_context, clear_log_context
 from values_parser import discover_addons_in_values
@@ -31,7 +30,7 @@ def check_dependencies(will_push: bool) -> None:
         logger.error(f"Missing required CLI tools: {', '.join(missing)}. Install them and ensure they are on PATH.")
         sys.exit(1)
 
-def process_helm_chart(helm_chart: HelmChart, downloaded_chart_folder: str, scan_only: bool, push_images: bool, pull_latest_flag: bool, yaml_file: Optional[str], new_appspec_folder: str, base_appspec_folder: str, target_registry: Optional[str], repository_prefix: Optional[str], include_dependencies: bool):
+def process_helm_chart(helm_chart: HelmChart, downloaded_chart_folder: str, scan_only: bool, push_images: bool, pull_latest_flag: bool, target_registry: Optional[str], repository_prefix: Optional[str], include_dependencies: bool):
     """
     Core pipeline to resolve version, download chart, extract and push images, and optionally push chart.
     In appspec mode, also updates and copies the original appspec YAML.
@@ -90,10 +89,6 @@ def process_helm_chart(helm_chart: HelmChart, downloaded_chart_folder: str, scan
         output_values_folder = f"{os.path.dirname(chart_file)}/values.yaml"
         convert_dict_to_yaml(chart_values, output_values_folder)
 
-        # If in appspec mode, update and copy the original appspec YAML
-        if yaml_file:
-            copy_and_update_yaml(yaml_file, new_appspec_folder, base_appspec_folder, new_version=helm_chart.addon_chart_version, private_ecr_url=helm_chart.private_ecr_url)
-            logger.info(f"Updated YAML file copied to: {new_appspec_folder}")
 
         # Build summary status
         error_msgs = []
@@ -114,15 +109,13 @@ def process_helm_chart(helm_chart: HelmChart, downloaded_chart_folder: str, scan
         clear_log_context()
         return None, str(e)
 
-def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest: bool = False, values_path: Optional[str] = None):
+def main(scan_only: bool, push_images: bool, latest: bool = False, values_path: Optional[str] = None):
     """
     Main function to process Helm charts either from:
     - AppSet mode: scanning ./application-sets for a matching appspec file, or
     - Values mode: parsing a local values.yaml that lists multiple addons.
     """
-    base_appspec_folder = './application-sets'
     downloaded_chart_folder = './helm-charts'
-    new_appspec_folder = './airgaped-application-sets'
     processed_charts = []
     summaries = []
 
@@ -131,10 +124,9 @@ def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest
     check_dependencies(will_push)
 
     # Determine mode
-    appspec_mode = bool(appspec_name)
-    values_mode = (not appspec_mode) and bool(values_path) and os.path.exists(values_path)
+    values_mode = bool(values_path) and os.path.exists(values_path)
 
-    if appspec_mode:
+    if False:
         yaml_files = get_yaml_files(base_appspec_folder)
         # Filter the specific appspec file based on the name passed as argument
         yaml_files = [f for f in yaml_files if appspec_name in f]
@@ -249,9 +241,6 @@ def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest
                 scan_only=scan_only,
                 push_images=push_images,
                 pull_latest_flag=pull_latest_flag,
-                yaml_file=None,  # no appspec copy/update in values mode
-                new_appspec_folder=new_appspec_folder,
-                base_appspec_folder=base_appspec_folder,
                 target_registry=args.target_registry,
                 repository_prefix=args.target_prefix,
                 include_dependencies=args.include_dependencies,
@@ -272,8 +261,7 @@ def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest
                         "error": err or "unknown error"
                     })
     else:
-        logger.error("No valid mode selected. Provide --appspec to process a specific appspec from application-sets "
-                     "or supply --values pointing to a values.yaml file containing multiple addons.")
+        logger.error("No valid mode selected. Supply --values pointing to a values.yaml file containing addons.")
         return
 
     # Summary (name, version, status in green/red, error text if any)
@@ -290,7 +278,6 @@ def main(appspec_name: Optional[str], scan_only: bool, push_images: bool, latest
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process Helm charts and update them with new versions and image repositories.')
-    parser.add_argument('--appspec', required=False, help='The name of the appspec to process (AppSet mode)')
     parser.add_argument('--values', default='./values.yaml', help='Path to a values.yaml that lists addons (Values mode)')
     parser.add_argument('--latest', action='store_true', help='Flag that pulls the latest images/versions when available')
     parser.add_argument('--scan-only', action='store_true', help='Flag to only scan images and not push them')
@@ -313,4 +300,7 @@ if __name__ == "__main__":
     # Only process specific addons by exact chart name (comma-separated, case-insensitive), values mode only
     parser.add_argument('--only-addon', required=False, help='Comma-separated chart names to process (exact match on chart, case-insensitive)')
     args = parser.parse_args()
-    main(args.appspec, args.scan_only, args.push_images, args.latest, args.values)
+    if not os.path.exists(args.values or "./values.yaml"):
+        logger.error(f"Values file not found: {args.values}")
+        sys.exit(1)
+    main(args.scan_only, args.push_images, args.latest, args.values)

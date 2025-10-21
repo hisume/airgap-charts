@@ -157,6 +157,10 @@ def main(scan_only: bool, push_images: bool, latest: bool = False, values_path: 
             # Docker Hub credentials (optional)
             helm_chart.dockerhub_username = args.dockerhub_username or os.getenv("DOCKERHUB_USERNAME", "")
             helm_chart.dockerhub_token = args.dockerhub_token or os.getenv("DOCKERHUB_TOKEN", "")
+            # ECR preflight flags
+            helm_chart.skip_existing = getattr(args, "skip_existing", True)
+            helm_chart.verify_existing_digest = getattr(args, "verify_existing_digest", False)
+            helm_chart.overwrite_existing = getattr(args, "overwrite_existing", False)
 
             # Use global latest flag as provided
             result = process_helm_chart(
@@ -297,6 +301,10 @@ if __name__ == "__main__":
     # Docker Hub auth (optional; increases rate limits and allows private pulls)
     parser.add_argument('--dockerhub-username', required=False, help='Docker Hub username for authenticated pulls (or set DOCKERHUB_USERNAME)')
     parser.add_argument('--dockerhub-token', required=False, help='Docker Hub access token/password for the username (or set DOCKERHUB_TOKEN)')
+    # ECR preflight controls
+    parser.add_argument('--skip-existing', action='store_true', default=True, help='Skip pushing images that already exist in private ECR (default: true)')
+    parser.add_argument('--verify-existing-digest', action='store_true', default=False, help='When skipping existing, verify digest matches source digest for selected platform')
+    parser.add_argument('--overwrite-existing', action='store_true', default=False, help='When digest differs in ECR, delete and overwrite the remote tag')
     # Only process specific addons by exact chart name (comma-separated, case-insensitive), values mode only
     parser.add_argument('--only-addon', required=False, help='Comma-separated chart names to process (exact match on chart, case-insensitive)')
     args = parser.parse_args()

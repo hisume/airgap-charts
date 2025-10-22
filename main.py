@@ -18,13 +18,13 @@ configure_colored_logging()
 def check_dependencies(will_push: bool) -> None:
     """
     Ensure required CLI tools are available on PATH.
-    Always require: helm, yq
-    Require when pushing: docker, aws
+    Always require: helm, yq, crane
+    Require when pushing: aws
     Exits the program with an error if any are missing.
     """
-    required = ["helm", "yq"]
+    required = ["helm", "yq", "crane"]
     if will_push:
-        required += ["docker", "aws"]
+        required += ["aws"]
     missing = [cmd for cmd in required if shutil.which(cmd) is None]
     if missing:
         logger.error(f"Missing required CLI tools: {', '.join(missing)}. Install them and ensure they are on PATH.")

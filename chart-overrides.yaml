@@ -1,0 +1,24 @@
+# External per-chart overrides to satisfy required values during 'helm template'
+# These values are injected as a values file (-f) automatically when present.
+#
+# Schema:
+# overrides:
+#   <chart-name>:
+#     <values-hierarchy>: <value>
+#
+# Examples below cover known charts that often require minimal values.
+
+overrides:
+  karpenter:
+    settings:
+      clusterName: placeholder
+      clusterEndpoint: https://placeholder
+
+  aws-load-balancer-controller:
+    clusterName: placeholder
+
+  # Add more charts here as needed, for example:
+  # metrics-server:
+  #   args:
+  #     - --kubelet-insecure-tls
+  #     - --kubelet-preferred-address-types=InternalIP,Hostname,ExternalIP

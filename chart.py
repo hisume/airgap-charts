@@ -391,16 +391,18 @@ class HelmChart:
         if override:
             login_args = ["registry", "login", "--username", "AWS", "--password-stdin", "public.ecr.aws"]
             logger.info("Helm registry login to public ECR (sandboxed) with provided token")
-            self.run_helm(login_args, "Failed helm registry login to public.ecr.aws with override", input_text=override, use_repo_flags=True)
-            logger.info("Helm logged into public ECR")
+            result = self.run_helm(login_args, "Failed helm registry login to public.ecr.aws with override", input_text=override, use_repo_flags=True)
+            if result is not None:
+                logger.info("Helm logged into public ECR")
         else:
             auth_cmd = ["aws", "ecr-public", "get-login-password", "--region", "us-east-1"]
             auth_output = subprocess.run(auth_cmd, stdout=subprocess.PIPE, check=True)
             auth_password = auth_output.stdout.decode().strip()
             login_args = ["registry", "login", "--username", "AWS", "--password-stdin", "public.ecr.aws"]
             logger.info("Helm registry login to public ECR (sandboxed) with AWS token")
-            self.run_helm(login_args, "Failed helm registry login to public.ecr.aws", input_text=auth_password, use_repo_flags=True)
-            logger.info("Helm logged into public ECR")
+            result = self.run_helm(login_args, "Failed helm registry login to public.ecr.aws", input_text=auth_password, use_repo_flags=True)
+            if result is not None:
+                logger.info("Helm logged into public ECR")
 
     def _login_ecr_private_chart(self):
         """
@@ -411,16 +413,18 @@ class HelmChart:
         if override:
             login_args = ["registry", "login", "--username", "AWS", "--password-stdin", self.private_ecr_url]
             logger.info(f"Helm registry login to private ECR (sandboxed): {self.private_ecr_url}")
-            self.run_helm(login_args, f"Failed helm registry login to {self.private_ecr_url} with override", input_text=override, use_repo_flags=True)
-            logger.info("Helm logged into private ECR")
+            result = self.run_helm(login_args, f"Failed helm registry login to {self.private_ecr_url} with override", input_text=override, use_repo_flags=True)
+            if result is not None:
+                logger.info("Helm logged into private ECR")
         else:
             auth_cmd = ["aws", "ecr", "get-login-password", "--region", self.region]
             auth_output = subprocess.run(auth_cmd, stdout=subprocess.PIPE, check=True)
             auth_password = auth_output.stdout.decode().strip()
             login_args = ["registry", "login", "--username", "AWS", "--password-stdin", self.private_ecr_url]
             logger.info(f"Helm registry login to private ECR (sandboxed) with AWS token: {self.private_ecr_url}")
-            self.run_helm(login_args, f"Failed helm registry login to {self.private_ecr_url}", input_text=auth_password, use_repo_flags=True)
-            logger.info("Helm logged into private ECR")
+            result = self.run_helm(login_args, f"Failed helm registry login to {self.private_ecr_url}", input_text=auth_password, use_repo_flags=True)
+            if result is not None:
+                logger.info("Helm logged into private ECR")
 
     # -------------------------
     # Repo/Dependency helpers
@@ -692,6 +696,25 @@ class HelmChart:
     # Image extraction + validate (daemonless)
     # -------------------------
 
+    def _load_overrides_for_chart(self) -> dict | None:
+        """
+        Load external per-chart overrides from ./chart-overrides.yaml.
+        Returns a dict of values for this chart, or None if not present.
+        """
+        try:
+            path = "./chart-overrides.yaml"
+            if not os.path.exists(path):
+                return None
+            yaml = YAML()
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.load(f) or {}
+            overrides_root = data.get("overrides") or {}
+            chart_vals = overrides_root.get(self.addon_chart)
+            return chart_vals if isinstance(chart_vals, dict) else None
+        except Exception as e:
+            logger.warning(f"Failed to load external overrides for {self.addon_chart}: {e}")
+            return None
+
     def get_chart_images(self, chart, exclude_dependencies=False):
         """
         Extracts images from the Helm chart templates.
@@ -707,6 +730,21 @@ class HelmChart:
 
         try:
             set_args = []
+            # External overrides: ./chart-overrides.yaml -> .helm-sandbox/<chart>/overrides.values.yaml
+            overrides = self._load_overrides_for_chart()
+            values_files_args = []
+            if overrides:
+                try:
+                    base_dir = os.path.join(".helm-sandbox", self.addon_chart)
+                    os.makedirs(base_dir, exist_ok=True)
+                    overrides_values_path = os.path.join(base_dir, "overrides.values.yaml")
+                    oyaml = YAML()
+                    with open(overrides_values_path, "w", encoding="utf-8") as f:
+                        oyaml.dump(overrides, f)
+                    logger.info(f"Applying overrides for {self.addon_chart} from ./chart-overrides.yaml -> {overrides_values_path}")
+                    values_files_args += ["-f", overrides_values_path]
+                except Exception as e:
+                    logger.warning(f"Unable to materialize external overrides for {self.addon_chart}: {e}")
 
             # Include dependencies: build them if missing and enable conditional deps
             if not exclude_dependencies and os.path.isdir(chart_root):
@@ -751,18 +789,20 @@ class HelmChart:
                 template_target = Path(chart_root)
 
             # Pre-inject minimal overrides for known charts to satisfy required values during template
-            if self.addon_chart == "aws-load-balancer-controller":
-                set_args += ["--set-string", "clusterName=placeholder"]
-            if self.addon_chart == "karpenter":
-                set_args += ["--set-string", "settings.clusterName=placeholder", "--set-string", "settings.clusterEndpoint=https://placeholder"]
+            # Only apply inline flags if no external overrides are provided
+            if not overrides:
+                if self.addon_chart == "aws-load-balancer-controller":
+                    set_args += ["--set-string", "clusterName=placeholder"]
+                if self.addon_chart == "karpenter":
+                    set_args += ["--set-string", "settings.clusterName=placeholder", "--set-string", "settings.clusterEndpoint=https://placeholder"]
 
             # Run helm template using sandboxed helm and enable dependency update to cope with stale locks
-            cmd_get_images = ["helm", "template", "--dependency-update", str(template_target)] + set_args
+            cmd_get_images = ["helm", "template", "--dependency-update", str(template_target)] + set_args + values_files_args
             args_template = cmd_get_images[1:]
             helm_output = self.run_helm(args_template, "Failed to get images")
 
             # If template failed due to required values, retry with minimal per-chart overrides
-            if helm_output is None:
+            if helm_output is None and not overrides:
                 override_flags = []
                 if self.addon_chart == "karpenter":
                     override_flags += ["--set-string", "settings.clusterName=placeholder", "--set-string", "settings.clusterEndpoint=https://placeholder"]
@@ -770,17 +810,73 @@ class HelmChart:
                     override_flags += ["--set-string", "clusterName=placeholder"]
                 if override_flags:
                     logger.info(f"Retrying helm template with minimal overrides for {self.addon_chart}")
-                    cmd_get_images_override = ["helm", "template", "--dependency-update", str(template_target)] + set_args + override_flags
+                    cmd_get_images_override = ["helm", "template", "--dependency-update", str(template_target)] + set_args + values_files_args + override_flags
                     args_template_override = cmd_get_images_override[1:]
                     helm_output = self.run_helm(args_template_override, "Failed to get images with overrides")
             
             if not helm_output:
                 raise Exception(f"Helm template produced no output for {self.addon_chart}; cannot extract images")
 
-            cmd_extract_images = ["yq", "..|.image? | select(.)"]
-            process = subprocess.Popen(cmd_extract_images, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stdout, stderr = process.communicate(input=helm_output)
-            unique_images = {image.split('@')[0] if '@' in image else image for image in stdout.splitlines() if image and image != '---'}
+            # Enhanced image extraction: compose fully-qualified refs from common patterns
+            images_found = set()
+            ryaml = YAML()
+            def _emit(repo: str | None, tag: str | None = None, digest: str | None = None, registry: str | None = None):
+                if not repo or not isinstance(repo, str):
+                    return
+                base = repo
+                if registry and isinstance(registry, str):
+                    # Prepend registry if repo is not already qualified or URL-like
+                    if not base.startswith(registry + "/") and not base.startswith("http"):
+                        base = f"{registry}/{base}"
+                ref = base
+                if tag and isinstance(tag, str):
+                    ref = f"{base}:{tag}"
+                elif digest and isinstance(digest, str) and digest.startswith("sha256:"):
+                    ref = f"{base}@{digest}"
+                images_found.add(ref)
+
+            def _visit(node):
+                if isinstance(node, dict):
+                    val = node.get("image")
+                    # Case 1: scalar image string
+                    if isinstance(val, str):
+                        images_found.add(val)
+                    # Case 2: nested image object with repository/tag/digest[/registry]
+                    elif isinstance(val, dict):
+                        repo = val.get("repository") or val.get("name")
+                        tag = val.get("tag")
+                        digest = val.get("digest")
+                        registry = val.get("registry") or node.get("registry")
+                        if repo:
+                            _emit(repo, tag, digest, registry)
+                    # Case 3: common split key patterns
+                    if "imageRepository" in node and "imageTag" in node:
+                        _emit(node.get("imageRepository"), node.get("imageTag"), None, node.get("imageRegistry") or node.get("registry"))
+                    if "repository" in node and "tag" in node:
+                        _emit(node.get("repository"), node.get("tag"), None, node.get("registry"))
+                    # Recurse
+                    for v in node.values():
+                        _visit(v)
+                elif isinstance(node, list):
+                    for it in node:
+                        _visit(it)
+
+            try:
+                docs = list(ryaml.load_all(helm_output))
+            except Exception:
+                docs = []
+            for d in docs:
+                _visit(d)
+
+            # Fallback heuristic: simple scrape of image: <value> if parsing yielded nothing
+            if not images_found:
+                for line in (helm_output or "").splitlines():
+                    if "image:" in line:
+                        val = line.split("image:", 1)[1].strip()
+                        if val and val != "---":
+                            images_found.add(val)
+
+            unique_images = {img.split('@')[0] if '@' in img else img for img in images_found if img}
             # Normalize hosts and dedupe again after normalization
             normalized_images = list({ self._normalize_image_host(img) for img in unique_images })
 

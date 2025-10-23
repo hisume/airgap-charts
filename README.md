@@ -24,11 +24,9 @@ What gets created
   - ./helm-charts/<chart>/values.yaml (image override snippet for private ECR)
 
 How it Works (high level)
-- Discovers addons from ./values.yaml (or a path you supply). It supports:
-  - A top-level “addons” key (list or map) with fields like chart, repository (or repoUrl), targetRevision (version), release name, optional oci_namespace
-  - Heuristic discovery for objects containing chart + repository/repoUrl
+- Discovers addons from ./values.yaml (or a path you supply) OR from a pre-built catalog file (see “Catalog Mode”).
 - For each addon:
-  - Resolves chart version (—latest or pinned targetRevision)
+  - Resolves chart version (--latest or pinned version)
   - Downloads chart and logs dependency graph (Chart.yaml + charts/ tree)
   - Renders chart (optionally with dependencies) and extracts image strings using yq
   - Validates each image exists (crane manifest) and copies to ECR (crane cp)
@@ -56,25 +54,94 @@ Platform handling (multi-arch vs single-arch)
 - Explicit (--platform linux/amd64 or linux/arm64):
   - The tool resolves the child manifest digest for the requested platform from the source image’s manifest index and copies that single-arch manifest (src@sha256:digest -> dst:tag).
 
-Dependency & Template Robustness
+Dependencies & Template Robustness
 - Dependencies:
   - helm dependency build (sandboxed) to vendor subcharts
   - If build fails, helm template is run with --dependency-update
   - For OCI dependencies on public.ecr.aws, the tool logs into public ECR before dependency operations
-- Template required values:
-  - Some charts require minimal values to render for image extraction. The tool pre‑injects minimal safe overrides:
-    - aws-load-balancer-controller:
-      --set-string clusterName=placeholder
-    - karpenter:
-      --set-string settings.clusterName=placeholder
-      --set-string settings.clusterEndpoint=https://placeholder
+- Template required values (External Overrides):
+  - Some charts require minimal values to render for image extraction. Provide them in ./chart-overrides.yaml (see “External Overrides” below). If no external entry exists for a chart, the tool falls back to minimal inline overrides for known charts (aws-load-balancer-controller, karpenter) to remain backwards-compatible.
 
-Repository Naming
-- Chart repository path (flattened):
-  - Chart stored as <registry>/<chart>:<version> (no prefix)
-- Image repository path:
-  - <registry>/<prefix?>/<chart>/<image_name>:<tag>
-- Optional “prefix” applies only to image repositories by default; chart repos are intentionally flattened under <chart>.
+External Overrides (chart-overrides.yaml)
+- You can inject per-chart minimal values during helm template without touching code by creating ./chart-overrides.yaml in the repo root.
+- Schema:
+```
+overrides:
+  <chart-name>:
+    <values-hierarchy>: <value>
+```
+- Example:
+```
+overrides:
+  karpenter:
+    settings:
+      clusterName: placeholder
+      clusterEndpoint: https://placeholder
+
+  aws-load-balancer-controller:
+    clusterName: placeholder
+```
+- Behavior:
+  - If overrides exist for a chart, they are written to .helm-sandbox/<chart>/overrides.values.yaml and passed to helm template via -f.
+  - If no external overrides are found for a chart, the tool applies minimal inline --set-string fallbacks for known charts (same values as above).
+
+Catalog Mode (alternate input)
+- Instead of scanning values.yaml live, you can run sync using a pre-built catalog file (YAML).
+- Catalog schema (top-level list under addons):
+```
+addons:
+  - chart: <str>
+    repository: <str>
+    oci_namespace: <str>
+    version: <str|None>
+    release: <str|None>
+```
+- Generate a catalog with the provided CLI (see next section), then run:
+```
+python main.py --catalog ./catalog.yaml --push-images --include-dependencies --skip-existing
+```
+- Notes:
+  - --only-addon and --exclude-addons still apply in catalog mode (by chart name, case-insensitive, exact match).
+  - If an entry has no version, the tool resolves the latest version during sync (same as values mode).
+
+Generator CLI (values_parser.py)
+- The catalog generator can be run directly:
+```
+python values_parser.py --values ./values.yaml --out ./catalog.yaml
+python values_parser.py --values ./values.yaml --out ./catalog.yaml --only-addon "aws-load-balancer-controller,karpenter"
+python values_parser.py --values ./values.yaml --out ./catalog.yaml --exclude-addons "argo-cd,kube-prometheus-stack"
+```
+- Arguments:
+  - --values (default ./values.yaml): input values defining addons
+  - --out (required): output path for catalog
+  - --only-addon: comma-separated chart names to include (case-insensitive, exact match)
+  - --exclude-addons: comma-separated chart names to exclude (case-insensitive, exact match)
+- Exit codes:
+  - 0 on success (even if filtered to zero addons)
+  - 1 on error
+
+ECR Preflight Controls (skip/verify/overwrite)
+- These flags control how existing tags in ECR are handled. They apply to all images (top‑level and dependency images when --include-dependencies is used).
+  - --skip-existing (default true):
+    - If a destination tag exists in ECR: skip pushing it.
+  - --verify-existing-digest (default false):
+    - When combined with --skip-existing, only skip if the existing ECR tag digest matches the source digest (index digest for auto, or platform child digest when --platform is set). If digests differ, treat as a mismatch.
+  - --overwrite-existing (default false):
+    - When a mismatch is detected, delete the existing ECR tag and push the new one.
+- Example behaviors:
+  - Fast presence skip:
+    - --skip-existing
+  - Digest-verified skip:
+    - --skip-existing --verify-existing-digest
+  - Force replacement on mismatch:
+    - --skip-existing --verify-existing-digest --overwrite-existing
+
+Filtering addons (values mode)
+- Process a subset of addons from values mode:
+  - --only-addon "name1,name2": only process listed charts (exact match on chart, case-insensitive)
+  - --exclude-addons "name3,name4": exclude listed charts (case-insensitive)
+- Order:
+  - Apply only-addon first, then exclude-addons.
 
 Requirements
 - Python 3.8+
@@ -98,10 +165,11 @@ python main.py --values ./values.yaml --latest --push-images --include-dependenc
 
 - Push to a specific registry and path prefix for images:
 ```
-python main.py --values ./values.yaml --push-images \
-  --target-registry 123456789012.dkr.ecr.us-east-1.amazonaws.com \
+python main.py --values ./values.yaml --push-images ^
+  --target-registry 123456789012.dkr.ecr.us-east-1.amazonaws.com ^
   --target-prefix team/x
 ```
+(Use \ on Linux/macOS instead of ^)
 
 - Dry run (extract images + write overrides, but do not push):
 ```
@@ -121,7 +189,7 @@ python main.py --values ./values.yaml --push-images --platform linux/amd64
 
 - Use Docker Hub credentials (raises rate limits & enables private pulls):
 ```
-python main.py --values ./values.yaml --push-images \
+python main.py --values ./values.yaml --push-images ^
   --dockerhub-username "<YOUR_USER>" --dockerhub-token "<YOUR_TOKEN>"
 # or with env:
 # set DOCKERHUB_USERNAME=<YOUR_USER>
@@ -129,11 +197,26 @@ python main.py --values ./values.yaml --push-images \
 # python main.py --values ./values.yaml --push-images
 ```
 
+End-to-end examples
+- Values → Catalog → Sync:
+```
+python values_parser.py --values ./values.yaml --out ./catalog.yaml
+python main.py --catalog ./catalog.yaml --push-images --include-dependencies --skip-existing
+```
+- Direct values with filters:
+```
+python main.py --values ./values.yaml --push-images --only-addon "aws-load-balancer-controller,karpenter" --exclude-addons "karpenter"
+```
+- External overrides:
+  - Create ./chart-overrides.yaml as shown above; run normal commands. The tool will detect and inject them during helm template.
+
 CLI Arguments (selected)
 - --values <path> (default: ./values.yaml)
   Path to an addons values.yaml containing multiple charts. The tool discovers addons by reading known keys (chart, repository/repoUrl, targetRevision) or heuristics.
+- --catalog <path>
+  Alternate input: pre-built catalog file (see Catalog Mode).
 - --latest
-  Prefer the latest chart version when resolving. If a chart version is omitted in values.yaml, latest is applied automatically for that chart.
+  Prefer the latest chart version when resolving. If a chart version is omitted in values.yaml or catalog, latest is applied automatically for that chart.
 - --scan-only
   Do not push images/charts. Useful to test render/extraction and generate override values without writing to ECR.
 - --push-images
@@ -158,8 +241,7 @@ CLI Arguments (selected)
   Docker Hub username for authenticated pulls (optional; used with crane auth login).
 - --dockerhub-token / env DOCKERHUB_TOKEN
   Docker Hub access token (or password) for the username (optional; used with crane auth login).
-- --only-addon <NAME[,NAME2,...]>
-  In values mode, only process addons whose chart exactly matches one of the provided names (case-insensitive).
+- --only-addon <NAME[,NAME2,...]> and --exclude-addons <NAME[,NAME2,...]> (values and catalog mode)
 
 Environment Variables (optional)
 - ECR_PUBLIC_PASSWORD
@@ -185,12 +267,14 @@ Troubleshooting
   - Ensure aws CLI v2 is installed and that your identity has ECR permissions. The tool uses aws ecr[-public] get-login-password to obtain tokens for crane and helm.
 - “name unknown” or 404 on helm push:
   - Chart pushes are flattened to repository named exactly after the chart (no prefix). This matches helm push to oci://<registry>.
+- OCI charts on ghcr.io:
+  - Some charts are not hosted in GHCR as Helm OCI artifacts. If an OCI lookup fails, use the equivalent HTTP Helm repo (e.g., https://grafana.github.io/helm-charts) for that chart in values or catalog.
 
 Support checklist for new engineers
 - Confirm prerequisites installed and on PATH (helm, yq, aws, crane)
 - Confirm AWS credentials for the target account/region
 - Decide: use default account ECR or set --target-registry and optionally --target-prefix
-- Decide dependency handling (—include-dependencies is recommended initially)
+- Decide dependency handling (--include-dependencies is recommended initially)
 - (Optional) Provide Docker Hub credentials to raise pull limits
 - Run:
 ```

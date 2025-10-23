@@ -1,6 +1,7 @@
 import argparse
 import logging
 import sys
+import os
 from typing import List, Tuple
 
 import boto3
@@ -95,7 +96,19 @@ def main():
     args = parser.parse_args()
 
     # Use default AWS identity/region from environment/config; do not accept ECR passwords for deletion.
-    session = boto3.Session()
+    aws_access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+    aws_secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+    aws_session_token = os.environ.get('AWS_SESSION_TOKEN')
+
+   
+
+ 
+
+    session = boto3.Session(
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key,
+        aws_session_token=aws_session_token
+    )
     region = session.region_name
     if not region:
         logger.error("No AWS region detected. Set AWS_DEFAULT_REGION or configure a default region (aws configure).")

@@ -12,6 +12,7 @@ helm-charts/
 .docker-sandbox/
 commands.txt
 sandbox/
+catalog.yaml
 
 # Distribution / packaging
 .Python

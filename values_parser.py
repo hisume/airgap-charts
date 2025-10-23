@@ -1,5 +1,6 @@
 import os
 import logging
+import argparse
 from typing import Dict, List, Any, Tuple
 from ruamel.yaml import YAML
 
@@ -134,3 +135,90 @@ def discover_addons_in_values(values_path: str = "./values.yaml") -> List[Dict[s
     addons = [a for a in addons if a.get("chart") and a.get("repository")]
 
     return addons
+
+def write_catalog(values_path: str, out_path: str) -> list[dict]:
+    """
+    Extract and normalize addons from a values.yaml and write a catalog YAML.
+
+    Catalog schema:
+    addons:
+      - chart: <str>
+        repository: <str>
+        oci_namespace: <str>
+        version: <str|None>
+        release: <str|None>
+    """
+    yaml = YAML()
+    addons = discover_addons_in_values(values_path)
+    data = {"addons": addons}
+    with open(out_path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f)
+    return addons
+
+def load_catalog(catalog_path: str) -> list[dict]:
+    """
+    Load a catalog YAML and return the normalized addons list.
+    Validates required fields (chart, repository) and drops invalid entries.
+    """
+    if not os.path.exists(catalog_path):
+        raise FileNotFoundError(f"catalog file not found: {catalog_path}")
+    yaml = YAML()
+    with open(catalog_path, "r", encoding="utf-8") as f:
+        data = yaml.load(f) or {}
+    addons = data.get("addons") or []
+    # Defensive normalization: ensure keys exist and types are dicts
+    norm: list[dict] = []
+    for a in addons:
+        if isinstance(a, dict) and a.get("chart") and a.get("repository"):
+            norm.append({
+                "chart": (a.get("chart") or "").strip(),
+                "repository": (a.get("repository") or "").strip(),
+                "oci_namespace": (a.get("oci_namespace") or "").strip(),
+                "version": a.get("version"),
+                "release": a.get("release") or "",
+            })
+    return norm
+
+if __name__ == "__main__":
+    """
+    CLI entrypoint to generate a catalog from a values.yaml.
+    Usage:
+      python values_parser.py --values ./values.yaml --out ./catalog.yaml [--only-addon "a,b"] [--exclude-addons "x,y"]
+    """
+    parser = argparse.ArgumentParser(description="Generate a normalized addons catalog from values.yaml")
+    parser.add_argument('--values', default='./values.yaml', help='Path to a values.yaml to discover addons from')
+    parser.add_argument('--out', required=True, help='Output path for the generated catalog YAML (e.g., ./catalog.yaml)')
+    parser.add_argument('--only-addon', required=False, help='Comma-separated chart names to include (exact match on chart, case-insensitive)')
+    parser.add_argument('--exclude-addons', required=False, help='Comma-separated chart names to exclude (exact match on chart, case-insensitive)')
+    args = parser.parse_args()
+
+    try:
+        addons = discover_addons_in_values(args.values)
+        if not addons:
+            logger.warning(f"No addons discovered in {args.values}")
+
+        # Apply include filter
+        if getattr(args, "only_addon", None):
+            selectors = {s.strip().lower() for s in str(args.only_addon).split(",") if s.strip()}
+            if selectors:
+                before = len(addons)
+                addons = [a for a in addons if (a.get("chart") or "").strip().lower() in selectors]
+                logger.info(f"Selected {len(addons)}/{before} addons via --only-addon: {', '.join(sorted(selectors))}")
+
+        # Apply exclude filter
+        if getattr(args, "exclude_addons", None):
+            excludes = {s.strip().lower() for s in str(args.exclude_addons).split(",") if s.strip()}
+            if excludes:
+                before = len(addons)
+                addons = [a for a in addons if (a.get("chart") or "").strip().lower() not in excludes]
+                logger.info(f"Excluded {before - len(addons)} addons via --exclude-addons: {', '.join(sorted(excludes))}")
+
+        # Write catalog
+        yaml = YAML()
+        out_data = {"addons": addons}
+        with open(args.out, "w", encoding="utf-8") as f:
+            yaml.dump(out_data, f)
+        logger.info(f"Wrote catalog with {len(addons)} addons to {args.out}")
+    except Exception as e:
+        logger.error(f"Failed to generate catalog: {e}")
+        raise SystemExit(1)

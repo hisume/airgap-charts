@@ -548,13 +548,13 @@ class HelmChart:
         use_oci = self._is_oci_repository()
         if use_oci:
             chart_ref = self._build_oci_chart_ref()
-            logger.info(f"Fetching version for {self.addon_chart} from OCI registry: {chart_ref}")
+            logger.info(f"Fetching version for {self.addon_chart} version {self.addon_chart_version} from OCI registry: {chart_ref}")
             # Only login for public ECR; ghcr.io usually doesn't require login to pull public charts
             if "public.ecr.aws" in (self.addon_chart_repository or ""):
                 self._login_ecr_public_chart()
             cmd_show_chart = ["helm", "show", "chart", chart_ref] if pull_latest else ["helm", "show", "chart", chart_ref, "--version", self.addon_chart_version]
         else:
-            logger.info(f"Fetching version for {self.addon_chart} from standard Helm repository: {self.addon_chart_repository}")
+            logger.info(f"Fetching version for {self.addon_chart} version {self.addon_chart_version}  from standard Helm repository: {self.addon_chart_repository}")
             cmd_show_chart = ["helm", "show", "chart", self.addon_chart, "--repo", self.addon_chart_repository] if pull_latest else ["helm", "show", "chart", self.addon_chart, "--repo", self.addon_chart_repository, "--version", self.addon_chart_version]
 
         try:
@@ -881,7 +881,49 @@ class HelmChart:
     def push_images_to_ecr(self, retry_count=3, retry_delay=5):
         """
         Copies container images to the private ECR repository using crane (daemonless).
+        Applies skip/verify/overwrite logic based on existing tags in ECR (sequential; no concurrency).
         """
+        def _crane_digest(ref: str) -> str | None:
+            """
+            Return the digest (sha256:...) for a reference using crane digest.
+            """
+            out = self.run_crane(["digest", ref], f"Failed to get digest for {ref}")
+            dig = (out or "").strip() if out is not None else ""
+            return dig if dig.startswith("sha256:") else None
+
+        def _ecr_tag_digest(repo: str, tag: str) -> str | None:
+            """
+            Return the digest for an existing ECR tag, or None if tag not found.
+            """
+            try:
+                resp = self.ecr_client.describe_images(
+                    repositoryName=repo,
+                    imageIds=[{"imageTag": tag}]
+                )
+                details = resp.get("imageDetails") or []
+                if details:
+                    dig = details[0].get("imageDigest") or ""
+                    return dig if dig.startswith("sha256:") else None
+            except ClientError as e:
+                # Image (tag) not found
+                if e.response.get("Error", {}).get("Code") in ("ImageNotFoundException", "RepositoryNotFoundException"):
+                    return None
+                logger.warning(f"ECR describe_images failed for {repo}:{tag}: {e}")
+            return None
+
+        def _delete_ecr_tag(repo: str, tag: str) -> None:
+            """
+            Delete a tag from ECR (best effort).
+            """
+            try:
+                self.ecr_client.batch_delete_image(
+                    repositoryName=repo,
+                    imageIds=[{"imageTag": tag}]
+                )
+                logger.info(f"Deleted existing ECR tag {repo}:{tag} before overwrite")
+            except ClientError as e:
+                logger.warning(f"Unable to delete ECR tag {repo}:{tag}: {e}")
+
         for public_repo in self.public_addon_chart_images:
             image_name = public_repo.rsplit('/', 1)[-1]
             repo_path = f"{self.repository_prefix}/{self.addon_chart}" if getattr(self, "repository_prefix", "") else self.addon_chart
@@ -922,20 +964,47 @@ class HelmChart:
             # Compose source reference depending on platform preference
             pref = getattr(self, "platform", "auto")
             src_ref = public_repo
+            src_digest = None
             if pref != "auto":
-                digest = self._resolve_platform_digest(public_repo, pref)
-                if digest:
+                plat_digest = self._resolve_platform_digest(public_repo, pref)
+                if plat_digest:
                     # Use digest-based source to force single-arch copy
                     base = public_repo.split("@", 1)[0]
-                    src_ref = f"{base}@{digest}"
+                    src_ref = f"{base}@{plat_digest}"
+                    src_digest = plat_digest
                     logger.info(f"Resolved {public_repo} -> {src_ref} for platform {pref}")
                 else:
                     logger.info(f"No platform-specific digest found for {public_repo}; attempting direct copy")
+            # If not already resolved, get digest (index or single-arch) for skip/verify checks
+            if not src_digest:
+                src_digest = _crane_digest(src_ref)
 
+            # Derive destination repo and tag
+            repo_no_tag = image_with_repo_path.split(":")[0]
+            image_tag = image_name.split(":")[1] if ":" in image_name else None
+
+            # Skip/verify/overwrite logic (tag-based)
+            if image_tag and getattr(self, "skip_existing", True):
+                dst_digest = _ecr_tag_digest(repo_no_tag, image_tag)
+                if dst_digest:
+                    if not getattr(self, "verify_existing_digest", False):
+                        logger.info(f"Skipping existing tag (no verify): {repo_no_tag}:{image_tag}")
+                        continue
+                    # verify_existing_digest = True
+                    if src_digest and dst_digest == src_digest:
+                        logger.info(f"Skipping existing tag with matching digest: {repo_no_tag}:{image_tag} ({dst_digest})")
+                        continue
+                    if getattr(self, "overwrite_existing", False):
+                        logger.info(f"Overwriting mismatched tag {repo_no_tag}:{image_tag} (dst={dst_digest}, src={src_digest or 'unknown'})")
+                        _delete_ecr_tag(repo_no_tag, image_tag)
+                    else:
+                        logger.warning(f"Digest mismatch for existing tag; skipping (set --overwrite-existing to replace): {repo_no_tag}:{image_tag}")
+                        continue
+
+            # Copy
             logger.info(f"Copying image via crane: {src_ref} -> {private_image}")
             for attempt in range(retry_count):
                 try:
-                    # crane cp <src> <dst>
                     result = self.run_crane(["cp", src_ref, private_image], f"Failed to copy image {src_ref} to {private_image}")
                     if result is not None:
                         logger.info(f"Successfully copied {public_repo} to {private_image}.")
@@ -978,6 +1047,16 @@ class HelmChart:
                 logger.error(f"Error describing ECR repositories: {e}")
                 raise Exception(f"Error describing ECR repositories: {e}")
 
+        # Skip chart push if this version already exists (tagged) in ECR
+        try:
+            repo_name = self.addon_chart
+            self.ecr_client.describe_images(repositoryName=repo_name, imageIds=[{"imageTag": self.addon_chart_version}])
+            logger.info(f"Chart {self.addon_chart}:{self.addon_chart_version} already exists in ECR at {self.private_ecr_url}/{repo_name}; skipping chart push.")
+            return
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ImageNotFoundException":
+                logger.error(f"Error checking existing chart image: {e}")
+                raise Exception(f"Error checking existing chart image: {e}")
         # Helm registry login for private ECR using current AWS identity (sandboxed)
         try:
             self._login_ecr_private_chart()

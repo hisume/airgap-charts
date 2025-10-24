@@ -35,20 +35,104 @@ def find_images(content, public_image, private_image, chart_values, parent_keys=
     public_image_repo = public_image.split(':')[0]
     private_image_repo, private_image_tag = private_image.split(':')
 
+    # Split private repo into registry host and repo path (host/path:tag)
+    private_registry = ""
+    private_repo_path = private_image_repo
+    if '/' in private_image_repo:
+        parts = private_image_repo.split('/', 1)
+        private_registry = parts[0]
+        private_repo_path = parts[1]
+
+    def _ensure_path(target: dict, keys: list[str]) -> dict:
+        d = target
+        for k in keys:
+            d = d.setdefault(k, {})
+        return d
+
     if isinstance(content, dict):
         for key, value in content.items():
             current_keys = parent_keys + [key]
             if isinstance(value, str) and public_image_repo in value:
-                print(f"Creating new values that will replace {value} with {private_image_repo}..")
-                d = chart_values
-                for k in current_keys[:-2]:
-                    d = d.setdefault(k, {})
-                d[current_keys[-2]] = {
-                    'repository': private_image_repo,
-                    'tag': private_image_tag
-                }
-                logger.info(f"Found {'.'.join(current_keys)}: {value}")
+                # Decide how to write overlay based on sibling keys (schema detection)
+                parent_obj = content  # dict that holds the key
+                # Case A: parent object contains registry split fields under an 'image' object
+                # e.g., image: { registry: ..., repository|image|name: ..., tag: ... }
+                # When key is "repository" or "image" or "name", the parent of this dict is the 'image' key one level up.
+                if any(k in parent_obj for k in ("registry", "repository", "image", "name")):
+                    # Navigate overlay to the parent of this object (drop the last key and set under that object)
+                    # e.g., ... -> image
+                    d = _ensure_path(chart_values, current_keys[:-2])
+                    image_obj_key = current_keys[-2]
+                    # Build overlay payload honoring schema
+                    payload = {}
+                    if "registry" in parent_obj:
+                        payload["registry"] = private_registry or private_image_repo.split('/')[0]
+                        # choose repo field name
+                        repo_field = "repository" if "repository" in parent_obj else ("image" if "image" in parent_obj else ("name" if "name" in parent_obj else "repository"))
+                        payload[repo_field] = private_repo_path if private_registry else private_image_repo
+                    else:
+                        # No explicit registry in schema; put full repo in repository/name
+                        repo_field = "repository" if "repository" in parent_obj else ("image" if "image" in parent_obj else ("name" if "name" in parent_obj else "repository"))
+                        payload[repo_field] = private_image_repo
+                    # tag if present in chart
+                    if "tag" in parent_obj:
+                        payload["tag"] = private_image_tag
+                    else:
+                        # Still set tag to be explicit
+                        payload["tag"] = private_image_tag
+                    d[image_obj_key] = payload
+                    logger.info(f"Found {'.'.join(current_keys)}: {value}")
+                # Case B: flattened keys on same level (imageRegistry/imageRepository/imageTag)
+                elif any(k in parent_obj for k in ("imageRegistry", "imageRepository", "imageTag")) or key in ("imageRepository", "imageRegistry", "imageTag"):
+                    # Write keys at current parent path (drop just the last key)
+                    d = _ensure_path(chart_values, current_keys[:-1])
+                    d["imageRegistry"] = private_registry or private_image_repo.split('/')[0]
+                    d["imageRepository"] = private_repo_path if private_registry else private_image_repo
+                    d["imageTag"] = private_image_tag
+                    logger.info(f"Found {'.'.join(current_keys)}: {value}")
+                # Case C: generic repository/tag pair on same parent
+                elif "repository" in parent_obj or key == "repository":
+                    d = _ensure_path(chart_values, current_keys[:-1])
+                    d["repository"] = private_image_repo
+                    d["tag"] = private_image_tag
+                    logger.info(f"Found {'.'.join(current_keys)}: {value}")
+                else:
+                    # Fallback: set under parent object if present, else set directly
+                    d = _ensure_path(chart_values, current_keys[:-2])
+                    parent_key = current_keys[-2] if len(current_keys) >= 2 else current_keys[-1]
+                    d[parent_key] = {
+                        'repository': private_image_repo,
+                        'tag': private_image_tag
+                    }
+                    logger.info(f"Found {'.'.join(current_keys)}: {value}")
             elif isinstance(value, dict):
+                # Detect split registry/repo schemas at this dict level and write overlay if matching
+                try:
+                    # Case A: value has registry + (repository|image|name)
+                    repo_key = "repository" if "repository" in value else ("image" if "image" in value else ("name" if "name" in value else None))
+                    if "registry" in value and repo_key and isinstance(value.get("registry"), str) and isinstance(value.get(repo_key), str):
+                        composed_src = f"{value.get('registry')}/{value.get(repo_key)}"
+                        if composed_src == public_image_repo:
+                            d = _ensure_path(chart_values, current_keys[:-1])
+                            payload = {}
+                            payload["registry"] = private_registry or private_image_repo.split('/')[0]
+                            payload[repo_key] = private_repo_path if private_registry else private_image_repo
+                            # Set tag explicitly
+                            payload["tag"] = private_image_tag
+                            d[current_keys[-1]] = payload
+                            logger.info(f"Found {'.'.join(current_keys)}: registry+{repo_key} matched {public_image_repo}")
+                    # Case B: flattened imageRegistry/imageRepository/imageTag
+                    if isinstance(value.get("imageRegistry"), str) and isinstance(value.get("imageRepository"), str):
+                        composed_src = f"{value.get('imageRegistry')}/{value.get('imageRepository')}"
+                        if composed_src == public_image_repo:
+                            d = _ensure_path(chart_values, current_keys[:-1])
+                            d["imageRegistry"] = private_registry or private_image_repo.split('/')[0]
+                            d["imageRepository"] = private_repo_path if private_registry else private_image_repo
+                            d["imageTag"] = private_image_tag
+                            logger.info(f"Found {'.'.join(current_keys)}: imageRegistry/imageRepository matched {public_image_repo}")
+                except Exception:
+                    # Non-fatal; continue recursion
+                    pass
                 find_images(value, public_image, private_image, chart_values, current_keys)
             elif isinstance(value, list):
                 for index, item in enumerate(value):

@@ -921,7 +921,8 @@ class HelmChart:
                         images_found.add(val)
                     # Case 2: nested image object with repository/tag/digest[/registry]
                     elif isinstance(val, dict):
-                        repo = val.get("repository") or val.get("name")
+                        # Support common schemas: repository|name|image + optional registry and tag
+                        repo = val.get("repository") or val.get("name") or val.get("image")
                         tag = val.get("tag")
                         digest = val.get("digest")
                         registry = val.get("registry") or node.get("registry")

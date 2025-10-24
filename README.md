@@ -69,18 +69,18 @@ flowchart TD
   C --> L
 
   subgraph Per_Addon
-    L --> R[Resolve version (latest or pinned)]
-    R --> D[Download chart (HTTP/OCI)]
-    D --> Dep[Log dependency graph / vendor deps?]
-    Dep --> T[helm template (+ overrides)]
-    T --> E[Extract images (yq)]
-    E --> O[Overlay private image refs into chart values.yaml (packaged) + repack]
-    O --> CP[Copy images to private ECR (crane cp)]
-    CP --> P[Push chart tgz to ECR (helm OCI)]
-    P --> W[Write ./helm-charts/{chart}/values.yaml (private refs)]
+    L --> R["Resolve version (latest or pinned)"]
+    R --> D["Download chart (HTTP/OCI)"]
+    D --> Dep["Log dependency graph / vendor deps?"]
+    Dep --> T["helm template (+ overrides)"]
+    T --> E["Extract images (yq)"]
+    E --> O["Overlay private image refs into chart values.yaml (packaged) + repack"]
+    O --> CP["Copy images to private ECR (crane cp)"]
+    CP --> P["Push chart tgz to ECR (helm OCI)"]
+    P --> W["Write ./helm-charts/{chart}/values.yaml (private refs)"]
   end
 
-  W --> S[Summary + status]
+  W --> S["Summary + status"]
 ```
 
 Per-chart sequence

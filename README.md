@@ -33,6 +33,58 @@ How it Works (high level)
   - Pushes chart tgz to ECR as OCI (flattened chart repo path)
   - Writes overrides ./helm-charts/<chart>/values.yaml (maps public image -> private repo/tag)
 
+Architecture (Quick Reference)
+- High-level pipeline
+```mermaid
+flowchart TD
+  A[Input] -->|values.yaml| V[discover_addons_in_values]
+  A -->|catalog.yaml| C[load_catalog]
+  V --> L[addons list]
+  C --> L
+
+  subgraph "Per Addon"
+    L --> R[Resolve version (latest or pinned)]
+    R --> D[Download chart (HTTP/OCI)]
+    D --> Dep[Log dependency graph / vendor deps?]
+    Dep --> T[helm template (+ overrides)]
+    T --> E[Extract images (yq)]
+    E --> O[Overlay private image refs into chart values.yaml (packaged) + repack]
+    O --> CP[Copy images to private ECR (crane cp)]
+    CP --> P[Push chart tgz to ECR (helm OCI)]
+    P --> W[Write ./helm-charts/<chart>/values.yaml (private refs)]
+  end
+
+  W --> S[Summary + status]
+```
+
+- Per-chart sequence
+```mermaid
+sequenceDiagram
+  participant CLI as main.py
+  participant Helm as helm
+  participant Crane as crane
+  participant AWS as ECR
+
+  CLI->>CLI: Parse args, check deps
+  CLI->>CLI: Load addons (values|catalog)
+  loop for each addon
+    CLI->>Helm: Resolve version (repo or OCI)
+    CLI->>Helm: Download chart
+    CLI->>Helm: dependency build / template (with overrides)
+    Helm-->>CLI: Rendered manifests
+    CLI->>CLI: Extract images via yq
+    CLI->>CLI: Compute private refs (mirror mapping)
+    CLI->>CLI: Apply values overlay to chart values.yaml + repack tgz
+    CLI->>Crane: cp images to private ECR
+    Crane-->>AWS: Push images
+    CLI->>Helm: Push chart OCI to ECR
+    CLI->>CLI: Write overrides values.yaml
+  end
+  CLI->>CLI: Log summary
+```
+
+Note: The tool modifies the chart’s packaged values.yaml (inside the extracted chart) to point to private image repositories, then repacks the chart tarball. This ensures the chart pushed to ECR has defaults referencing private images. Separately, it writes ./helm-charts/<chart>/values.yaml which maps public→private for consumers to use as an override if desired.
+
 Authentication & Daemonless Operation
 - No Docker daemon is used.
 - Container images:
@@ -101,7 +153,7 @@ addons:
 python main.py --catalog ./catalog.yaml --push-images --include-dependencies --skip-existing
 ```
 - Notes:
-  - --only-addon and --exclude-addons still apply in catalog mode (by chart name, case-insensitive, exact match).
+  - --only-addon and --exclude-addons still apply in catalog mode (by release name, case-insensitive, exact match).
   - If an entry has no version, the tool resolves the latest version during sync (same as values mode).
 
 Generator CLI (values_parser.py)
@@ -283,3 +335,27 @@ python main.py --values ./values.yaml --latest --push-images --include-dependenc
 - Verify in ECR:
   - Chart repository: <registry>/<chart>
   - Image repos: <registry>/<prefix?>/<chart>/<image_name>
+
+Quick Reference: CLI and Examples
+- Inputs
+  - Values mode: --values ./values.yaml (default)
+  - Catalog mode: --catalog ./catalog.yaml
+- Filtering
+  - Values mode filters by CHART name
+  - Catalog mode filters by RELEASE name
+  - Examples (catalog mode):
+    - Scan-only subset by release:
+      - python main.py --catalog ./catalog.yaml --scan-only --only-addon "argocd,karpenter"
+    - Exclude a release:
+      - python main.py --catalog ./catalog.yaml --push-images --exclude-addons "argocd"
+- Registry target and prefix
+  - python main.py --values ./values.yaml --push-images --target-registry 123456789012.dkr.ecr.us-east-1.amazonaws.com --target-prefix team/x
+- Dependency control
+  - Include (default): --include-dependencies
+  - Exclude: --exclude-dependencies
+- Platform
+  - Default multi-arch: --platform auto
+  - Single-arch copy: --platform linux/amd64 (or linux/arm64)
+- Auth
+  - Docker Hub:
+    - python main.py --values ./values.yaml --push-images --dockerhub-username "<USER>" --dockerhub-token "<TOKEN>"

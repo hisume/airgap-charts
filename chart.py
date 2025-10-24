@@ -662,6 +662,66 @@ class HelmChart:
         return chart_file
 
     # -------------------------
+    # Chart mutation helpers (apply overlay and repack)
+    # -------------------------
+
+    def _deep_merge(self, base, overlay):
+        """
+        Recursively deep-merge overlay dict into base dict (in place).
+        Lists and scalars are replaced by overlay; dicts are merged.
+        """
+        if not isinstance(base, dict) or not isinstance(overlay, dict):
+            return overlay
+        for k, v in overlay.items():
+            if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+                self._deep_merge(base[k], v)
+            else:
+                base[k] = v
+        return base
+
+    def apply_values_overlay(self, chart_root: str, overlay: dict) -> None:
+        """
+        Merge overlay values (e.g., private image mappings) into the chart's own values.yaml.
+        """
+        try:
+            values_path = os.path.join(chart_root, "values.yaml")
+            yaml = YAML()
+            data = {}
+            if os.path.exists(values_path):
+                with open(values_path, "r", encoding="utf-8") as f:
+                    existing = yaml.load(f)
+                    if isinstance(existing, dict):
+                        data = existing
+            if not isinstance(overlay, dict) or not overlay:
+                return
+            self._deep_merge(data, overlay)
+            with open(values_path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f)
+            logger.info(f"Applied private image overlay into {values_path}")
+        except Exception as e:
+            logger.warning(f"Failed to apply values overlay for {self.addon_chart}: {e}")
+
+    def repack_chart(self, chart_root: str, out_tgz_path: str) -> None:
+        """
+        Repack the extracted chart directory back into a .tgz at out_tgz_path.
+        Ensures the archive has a top-level folder equal to the chart directory name.
+        """
+        try:
+            parent = os.path.dirname(chart_root)
+            base_name = os.path.basename(chart_root.rstrip(os.sep))
+            # Write to a temp path then replace
+            tmp_tgz = out_tgz_path + ".tmp"
+            with tarfile.open(tmp_tgz, "w:gz") as tar:
+                tar.add(chart_root, arcname=base_name)
+            # Replace original tgz
+            if os.path.exists(out_tgz_path):
+                os.remove(out_tgz_path)
+            os.replace(tmp_tgz, out_tgz_path)
+            logger.info(f"Repacked chart {base_name} into {out_tgz_path}")
+        except Exception as e:
+            logger.warning(f"Failed to repack chart for {self.addon_chart}: {e}")
+
+    # -------------------------
     # Dependency logging
     # -------------------------
 
@@ -974,6 +1034,70 @@ class HelmChart:
         # Single-arch manifest: nothing to resolve
         return None
 
+    def _parse_image_ref(self, ref: str):
+        """
+        Parse a container image reference into (registry, repo_path, tag, digest).
+        Handles short Docker Hub names (e.g., 'nginx' -> docker.io/library/nginx).
+        """
+        registry = ""
+        repo_path = ref
+        tag = None
+        digest = None
+
+        # Extract digest if present
+        if "@sha256:" in ref:
+            base, dig = ref.split("@", 1)
+            ref = base
+            digest = dig if dig.startswith("sha256:") else f"sha256:{dig.split(':')[-1]}"
+
+        # Split tag carefully (only if present in the last segment)
+        name_part = ref
+        if ":" in ref:
+            if "/" in ref:
+                prefix, last = ref.rsplit("/", 1)
+            else:
+                prefix, last = "", ref
+            if ":" in last:
+                nm, tg = last.split(":", 1)
+                name_part = f"{prefix}/{nm}" if prefix else nm
+                tag = tg
+
+        # Detect registry vs repo path
+        first = name_part.split("/", 1)[0]
+        rest = name_part.split("/", 1)[1] if "/" in name_part else ""
+        if "." in first or ":" in first or first == "localhost":
+            registry = first
+            repo_path = rest
+        else:
+            # Docker Hub short or org-qualified reference
+            registry = "docker.io"
+            if rest:
+                repo_path = name_part
+            else:
+                repo_path = f"library/{first}"
+        return registry, repo_path, tag, digest
+
+    def compute_private_refs(self) -> list[str]:
+        """
+        Compute destination private image references for all discovered public images,
+        without performing any push operations. Uses mirror-source layout with optional prefix.
+        """
+        if not self.private_ecr_url:
+            self.get_private_ecr_url()
+        private_refs: list[str] = []
+        for public_repo in self.public_addon_chart_images:
+            _, src_repo_path, src_tag, src_digest = self._parse_image_ref(public_repo)
+            dest_repo_path = f"{self.repository_prefix}/{src_repo_path}" if getattr(self, "repository_prefix", "") else src_repo_path
+            # Determine tag
+            image_tag = src_tag
+            if not image_tag:
+                if src_digest and src_digest.startswith("sha256:"):
+                    image_tag = f"sha-{src_digest[7:19]}"
+                else:
+                    image_tag = "latest"
+            private_refs.append(f"{self.private_ecr_url}/{dest_repo_path}:{image_tag}")
+        return private_refs
+
     def push_images_to_ecr(self, retry_count=3, retry_delay=5):
         """
         Copies container images to the private ECR repository using crane (daemonless).
@@ -1021,15 +1145,22 @@ class HelmChart:
                 logger.warning(f"Unable to delete ECR tag {repo}:{tag}: {e}")
 
         for public_repo in self.public_addon_chart_images:
-            image_name = public_repo.rsplit('/', 1)[-1]
-            repo_path = f"{self.repository_prefix}/{self.addon_chart}" if getattr(self, "repository_prefix", "") else self.addon_chart
-            image_with_repo_path = f"{repo_path}/{image_name}"
-            private_image = f"{self.private_ecr_url}/{image_with_repo_path}"
+            # Mirror source layout: destination repo mirrors source repo path (host swap + optional prefix)
+            _, src_repo_path, src_tag, src_digest = self._parse_image_ref(public_repo)
+            dest_repo_path = f"{self.repository_prefix}/{src_repo_path}" if getattr(self, "repository_prefix", "") else src_repo_path
+            # Determine destination tag
+            image_tag = src_tag
+            if not image_tag:
+                if src_digest and src_digest.startswith("sha256:"):
+                    image_tag = f"sha-{src_digest[7:19]}"
+                else:
+                    image_tag = "latest"
+            private_image = f"{self.private_ecr_url}/{dest_repo_path}:{image_tag}"
             self.private_addon_chart_images.append(private_image)
 
             # Ensure destination ECR repository exists
             try:
-                ecr_repo = image_with_repo_path.split(':')[0]
+                ecr_repo = dest_repo_path
                 self.ecr_client.describe_repositories(repositoryNames=[ecr_repo])
                 logger.info(f"ECR repository {ecr_repo} exists.")
             except ClientError as e:
@@ -1076,8 +1207,8 @@ class HelmChart:
                 src_digest = _crane_digest(src_ref)
 
             # Derive destination repo and tag
-            repo_no_tag = image_with_repo_path.split(":")[0]
-            image_tag = image_name.split(":")[1] if ":" in image_name else None
+            repo_no_tag = dest_repo_path
+            # image_tag already computed above
 
             # Skip/verify/overwrite logic (tag-based)
             if image_tag and getattr(self, "skip_existing", True):

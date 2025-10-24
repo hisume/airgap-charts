@@ -74,6 +74,21 @@ def process_helm_chart(helm_chart: HelmChart, downloaded_chart_folder: str, scan
         logger.info("Pulling chart Images...")
         helm_chart.pulling_chart_images()
 
+        # Inject private image mapping into the chart's packaged values.yaml and repack before pushing
+        # Compute private refs first (mirror-source layout), then overlay so packaged defaults match pushed images
+        try:
+            values_folder_from_chart_file = f"{os.path.dirname(chart_file)}/{helm_chart.addon_chart}/values.yaml"
+            public_images = helm_chart.public_addon_chart_images
+            private_refs = helm_chart.compute_private_refs()
+            # Make private refs available downstream as well
+            helm_chart.private_addon_chart_images = private_refs
+            chart_values_overlay = extract_chart_values_image(values_folder_from_chart_file, public_images, private_refs)
+            chart_root = f"{os.path.dirname(chart_file)}/{helm_chart.addon_chart}"
+            helm_chart.apply_values_overlay(chart_root, chart_values_overlay)
+            helm_chart.repack_chart(chart_root, chart_file)
+        except Exception as e:
+            logger.warning(f"Failed to apply private image overlay/repack for {helm_chart.addon_chart}: {e}")
+
         if push_images or (not scan_only and not push_images):
             logger.info("Pushing Images to ECR...")
             helm_chart.push_images_to_ecr()
@@ -144,8 +159,8 @@ def main(scan_only: bool, push_images: bool, latest: bool = False, values_path: 
             selectors = {s.strip().lower() for s in str(args.only_addon).split(",") if s.strip()}
             if selectors:
                 before = len(addons)
-                addons = [a for a in addons if (a.get("chart") or "").strip().lower() in selectors]
-                selected_names = ", ".join([a.get("chart") or "" for a in addons])
+                addons = [a for a in addons if (a.get("release") or "").strip().lower() in selectors]
+                selected_names = ", ".join([a.get("release") or "" for a in addons])
                 logger.info(f"Selected {len(addons)}/{before} addons via --only-addon: {selected_names}")
                 if not addons:
                     logger.warning("No addons matched --only-addon filter; exiting.")
@@ -155,8 +170,8 @@ def main(scan_only: bool, push_images: bool, latest: bool = False, values_path: 
             excludes = {s.strip().lower() for s in str(args.exclude_addons).split(",") if s.strip()}
             if excludes:
                 before = len(addons)
-                addons = [a for a in addons if (a.get("chart") or "").strip().lower() not in excludes]
-                logger.info(f"Excluded {before - len(addons)} addons via --exclude-addons: {', '.join(sorted(excludes))}")
+                addons = [a for a in addons if (a.get("release") or "").strip().lower() not in excludes]
+                logger.info(f"Excluded {before - len(addons)} addons via --exclude-addons (by release): {', '.join(sorted(excludes))}")
                 if not addons:
                     logger.warning("All addons excluded by --exclude-addons; exiting.")
                     return
@@ -414,8 +429,8 @@ if __name__ == "__main__":
     parser.add_argument('--verify-existing-digest', action='store_true', default=False, help='When skipping existing, verify digest matches source digest for selected platform')
     parser.add_argument('--overwrite-existing', action='store_true', default=False, help='When digest differs in ECR, delete and overwrite the remote tag')
     # Only process specific addons by exact chart name (comma-separated, case-insensitive), values mode only
-    parser.add_argument('--only-addon', required=False, help='Comma-separated chart names to process (exact match on chart, case-insensitive)')
-    parser.add_argument('--exclude-addons', required=False, help='Comma-separated chart names to exclude (exact match on chart, case-insensitive)')
+    parser.add_argument('--only-addon', required=False, help='Filter: Values mode = chart names; Catalog mode = release names (comma-separated, case-insensitive, exact match)')
+    parser.add_argument('--exclude-addons', required=False, help='Filter: Values mode = chart names; Catalog mode = release names (comma-separated, case-insensitive, exact match)')
     args = parser.parse_args()
     if not os.path.exists(args.values or "./values.yaml"):
         logger.error(f"Values file not found: {args.values}")

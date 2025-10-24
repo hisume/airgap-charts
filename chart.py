@@ -320,10 +320,15 @@ class HelmChart:
             self._crane_auth_login("public.ecr.aws", "AWS", override)
         else:
             auth_cmd = ["aws", "ecr-public", "get-login-password", "--region", "us-east-1"]
-            auth_output = subprocess.run(auth_cmd, stdout=subprocess.PIPE, check=True)
-            auth_password = auth_output.stdout.decode().strip()
-            logger.info("Crane auth to public ECR with AWS token")
-            self._crane_auth_login("public.ecr.aws", "AWS", auth_password)
+            try:
+                auth_output = subprocess.run(auth_cmd, stdout=subprocess.PIPE, check=True, timeout=30)
+                auth_password = auth_output.stdout.decode().strip()
+                logger.info("Crane auth to public ECR with AWS token")
+                self._crane_auth_login("public.ecr.aws", "AWS", auth_password)
+            except subprocess.TimeoutExpired:
+                logger.warning("Timed out obtaining public ECR login password via aws CLI; proceeding without crane auth to public ECR")
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"Failed to obtain public ECR login password via aws CLI; proceeding without crane auth to public ECR: {e}")
         self.public_ecr_authenticated = True
         logger.info("Authenticated to public.ecr.aws (crane)")
 
@@ -396,13 +401,18 @@ class HelmChart:
                 logger.info("Helm logged into public ECR")
         else:
             auth_cmd = ["aws", "ecr-public", "get-login-password", "--region", "us-east-1"]
-            auth_output = subprocess.run(auth_cmd, stdout=subprocess.PIPE, check=True)
-            auth_password = auth_output.stdout.decode().strip()
-            login_args = ["registry", "login", "--username", "AWS", "--password-stdin", "public.ecr.aws"]
-            logger.info("Helm registry login to public ECR (sandboxed) with AWS token")
-            result = self.run_helm(login_args, "Failed helm registry login to public.ecr.aws", input_text=auth_password, use_repo_flags=True)
-            if result is not None:
-                logger.info("Helm logged into public ECR")
+            try:
+                auth_output = subprocess.run(auth_cmd, stdout=subprocess.PIPE, check=True, timeout=30)
+                auth_password = auth_output.stdout.decode().strip()
+                login_args = ["registry", "login", "--username", "AWS", "--password-stdin", "public.ecr.aws"]
+                logger.info("Helm registry login to public ECR (sandboxed) with AWS token")
+                result = self.run_helm(login_args, "Failed helm registry login to public.ecr.aws", input_text=auth_password, use_repo_flags=True)
+                if result is not None:
+                    logger.info("Helm logged into public ECR")
+            except subprocess.TimeoutExpired:
+                logger.warning("Timed out obtaining public ECR login password via aws CLI; attempting helm operations without registry login")
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"Failed to obtain public ECR login password via aws CLI; attempting helm operations without registry login: {e}")
 
     def _login_ecr_private_chart(self):
         """
@@ -635,10 +645,18 @@ class HelmChart:
 
         chart_file = os.path.join(chart_dir, f"{self.addon_chart}-{version}.tgz")
         if os.path.exists(chart_file):
-            logger.info(f"Chart file already exists at: {chart_file}")
-            with tarfile.open(chart_file, 'r:gz') as tar:
-                tar.extractall(path=f"{chart_dir}")
-            return chart_file
+            logger.info(f"Removing existing chart file to force fresh download: {chart_file}")
+            try:
+                os.remove(chart_file)
+            except Exception as e:
+                logger.warning(f"Unable to remove existing chart file {chart_file}: {e}")
+            # Clean extracted chart directory if present to avoid stale overlays
+            extracted_root = os.path.join(chart_dir, self.addon_chart)
+            if os.path.isdir(extracted_root):
+                try:
+                    shutil.rmtree(extracted_root)
+                except Exception as e:
+                    logger.warning(f"Unable to remove extracted chart directory {extracted_root}: {e}")
 
         use_oci = self._is_oci_repository()
         if use_oci:
@@ -939,6 +957,19 @@ class HelmChart:
             unique_images = {img.split('@')[0] if '@' in img else img for img in images_found if img}
             # Normalize hosts and dedupe again after normalization
             normalized_images = list({ self._normalize_image_host(img) for img in unique_images })
+            # Filter out any refs already pointing at private ECR (validate/copy only source refs)
+            skipped_private = []
+            if self.private_ecr_url:
+                priv_prefix = f"{self.private_ecr_url}/"
+                filtered_images = []
+                for img in normalized_images:
+                    if img.startswith(priv_prefix):
+                        skipped_private.append(img)
+                    else:
+                        filtered_images.append(img)
+                if skipped_private:
+                    logger.info(f"Skipping {len(skipped_private)} private refs from validation: {skipped_private[:3]}{'...' if len(skipped_private)>3 else ''}")
+                normalized_images = filtered_images
 
             # Authenticate to Docker Hub up-front if any Docker Hub images are present and creds provided
             if any(self._is_dockerhub_image(img) for img in normalized_images) and getattr(self, "dockerhub_username", "") and getattr(self, "dockerhub_token", ""):
@@ -976,7 +1007,14 @@ class HelmChart:
         No-op pull in daemonless mode. We validate reachability via crane manifest with retries.
         """
         logger.info(f"Validating availability of images (daemonless) for chart {self.addon_chart}")
-        for image in self.public_addon_chart_images:
+        images_to_check = list(self.public_addon_chart_images)
+        if self.private_ecr_url:
+            priv_prefix = f"{self.private_ecr_url}/"
+            images_to_check = [i for i in images_to_check if not i.startswith(priv_prefix)]
+            skipped = len(self.public_addon_chart_images) - len(images_to_check)
+            if skipped > 0:
+                logger.info(f"Skipping {skipped} private refs during validation (will be created by copy).")
+        for image in images_to_check:
             image = self._normalize_image_host(image)
             for attempt in range(retry_count):
                 try:
@@ -1257,16 +1295,16 @@ class HelmChart:
         """
         Pushes the Helm chart to the private ECR repository with retry logic.
         """
+        ns = (self.addon_chart_repository_namespace or "").strip("/")
+        repo_path = f"{ns}/{self.addon_chart}" if ns else self.addon_chart
         try:
-            repo_name = self.addon_chart
-            self.ecr_client.describe_repositories(repositoryNames=[repo_name])
-            logger.info(f"ECR repository {self.private_ecr_url}/{repo_name} exists.")
+            self.ecr_client.describe_repositories(repositoryNames=[repo_path])
+            logger.info(f"ECR repository {self.private_ecr_url}/{repo_path} exists.")
         except ClientError as e:
             if e.response["Error"]["Code"] == "RepositoryNotFoundException":
-                repo_name = self.addon_chart
-                logger.info(f"Repository {self.private_ecr_url}/{repo_name} not found, creating new repository...")
+                logger.info(f"Repository {self.private_ecr_url}/{repo_path} not found, creating new repository...")
                 try:
-                    self.ecr_client.create_repository(repositoryName=repo_name, tags=[{"Key": "chart-syncer", "Value": "true"}])
+                    self.ecr_client.create_repository(repositoryName=repo_path, tags=[{"Key": "chart-syncer", "Value": "true"}])
                 except ClientError as create_err:
                     logger.error(f"Unable to create ECR repository: {create_err}")
                     raise Exception(f"Unable to create ECR repository: {create_err}")
@@ -1276,9 +1314,8 @@ class HelmChart:
 
         # Skip chart push if this version already exists (tagged) in ECR
         try:
-            repo_name = self.addon_chart
-            self.ecr_client.describe_images(repositoryName=repo_name, imageIds=[{"imageTag": self.addon_chart_version}])
-            logger.info(f"Chart {self.addon_chart}:{self.addon_chart_version} already exists in ECR at {self.private_ecr_url}/{repo_name}; skipping chart push.")
+            self.ecr_client.describe_images(repositoryName=repo_path, imageIds=[{"imageTag": self.addon_chart_version}])
+            logger.info(f"Chart {self.addon_chart}:{self.addon_chart_version} already exists in ECR at {self.private_ecr_url}/{repo_path}; skipping chart push.")
             return
         except ClientError as e:
             if e.response["Error"]["Code"] != "ImageNotFoundException":
@@ -1291,13 +1328,13 @@ class HelmChart:
             logger.warning(f"Helm registry login to private ECR failed; proceeding may fail: {e}")
 
         # Flattened chart push: push under chart name with no prefix
-        dest_repo = f"oci://{self.private_ecr_url}"
+        dest_repo = f"oci://{self.private_ecr_url}/{ns}" if ns else f"oci://{self.private_ecr_url}"
         for attempt in range(retry_count):
             try:
                 args_push_chart = ["push", chart_file, dest_repo]
                 result = self.run_helm(args_push_chart, "Failed to push chart to ECR")
                 if result is not None:
-                    logger.info(f"Successfully pushed {self.addon_chart} to ECR.")
+                    logger.info(f"Successfully pushed {self.private_ecr_url}/{repo_path}:{self.addon_chart_version}")
                     break
                 else:
                     logger.warning(f"Attempt {attempt + 1} failed to push chart {chart_file} to {self.private_ecr_url}")

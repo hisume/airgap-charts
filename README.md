@@ -239,7 +239,7 @@ Rationale: catalogs describe intended release names in environments, so filterin
 
 Per chart:
 - Chart OCI pushed to:
-  - `oci://{registry}/{chart}:{chart_version}` (flattened chart repo path)
+  - `oci://{registry}/{namespace?}/{chart}:{chart_version}` (mirrors source chart namespace when present)
 - Images pushed to:
   - `{registry}/{prefix?}/{chart}/{image_name}:{tag}`
 - Local output files:
@@ -255,7 +255,7 @@ Per chart:
 - ECR auth errors
   - Ensure aws CLI v2 is installed and your identity has ECR permissions. Tool uses `aws ecr[-public] get-login-password` for crane and helm.
 - “name unknown” or 404 on helm push
-  - Charts are flattened to `{registry}/{chart}`. Ensure you are pushing to the registry root (`oci://{registry}`) with correct auth.
+  - Charts mirror oci_namespace: `{registry}/{namespace?}/{chart}`. Ensure you are pushing to the correct destination: `oci://{registry}/{namespace}` when a namespace exists, otherwise `oci://{registry}`.
 - OCI charts on ghcr.io
   - Some charts are not published to GHCR as Helm OCI artifacts. Prefer HTTP Helm repos when OCI lookup fails.
 
@@ -271,5 +271,5 @@ Per chart:
   python main.py --values ./values.yaml --latest --push-images --include-dependencies --platform auto
   ```
 - Verify in ECR:
-  - Chart repository: `{registry}/{chart}`
+  - Chart repository: `{registry}/{namespace?}/{chart}`
   - Image repositories: `{registry}/{prefix?}/{chart}/{image_name}`

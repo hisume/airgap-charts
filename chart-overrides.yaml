@@ -17,6 +17,11 @@ overrides:
   aws-load-balancer-controller:
     clusterName: placeholder
 
+  kyverno:
+    openreports:
+      enabled: false
+      installCrds: false
+
   # Add more charts here as needed, for example:
   # metrics-server:
   #   args:

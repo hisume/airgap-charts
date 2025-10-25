@@ -845,12 +845,7 @@ class HelmChart:
                 dep_build_out = self.run_helm(["dependency", "build", chart_root], "Failed to build chart dependencies")
                 if dep_build_out is None:
                     logger.warning("Dependency build failed; skipping vendored subcharts and relying on --dependency-update during template")
-                # Enable any conditional dependencies explicitly
-                declared = self._collect_declared_dependencies(chart_root)
-                for dep in declared:
-                    cond = (dep.get("condition") or "").strip()
-                    if cond:
-                        set_args += ["--set", f"{cond}=true"]
+                # Do not force-enable conditional dependencies; honor chart defaults and external overrides
 
                 template_target = Path(chart_root)
 
@@ -873,6 +868,9 @@ class HelmChart:
                     set_args += ["--set-string", "clusterName=placeholder"]
                 if self.addon_chart == "karpenter":
                     set_args += ["--set-string", "settings.clusterName=placeholder", "--set-string", "settings.clusterEndpoint=https://placeholder"]
+                if self.addon_chart == "kyverno":
+                    # Keep OpenReports consistent to avoid template failure during image extraction
+                    set_args += ["--set", "openreports.installCrds=false", "--set", "openreports.enabled=false"]
 
             # Run helm template using sandboxed helm and enable dependency update to cope with stale locks
             cmd_get_images = ["helm", "template", "--dependency-update", str(template_target)] + set_args + values_files_args

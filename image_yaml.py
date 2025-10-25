@@ -152,7 +152,7 @@ def extract_chart_values_image(chart_image_yaml_file, public_images, private_ima
     :return: Dictionary containing key-value pairs of found images
     '''
     yaml = YAML()
-    with open(chart_image_yaml_file, 'r') as file:
+    with open(chart_image_yaml_file, 'r', encoding='utf-8', errors='replace') as file:
         logger.info(f"Extracting Images from {chart_image_yaml_file}")
         content = yaml.load(file)
         
@@ -182,7 +182,7 @@ def convert_dict_to_yaml(chart_values, output_file):
     '''
     yaml = YAML()
     
-    with open(output_file, 'w') as file:
+    with open(output_file, 'w', encoding='utf-8') as file:
         yaml.dump(chart_values, file)
 
     logger.info(f"Updated values saved to {output_file}")

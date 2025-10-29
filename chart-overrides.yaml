@@ -22,6 +22,22 @@ overrides:
       enabled: false
       installCrds: false
 
+  argo-cd:
+    dex:
+      enabled: false
+    commitServer: 
+      enabled: false
+  
+  cluster-proportional-autoscaler:
+    options:
+      target: "deployment"
+
+  splunk-otel-collector:
+    splunkPlatform:
+      endpoint: "https://sadf.com"
+      token: "asdf"
+    clusterName: test
+
   # Add more charts here as needed, for example:
   # metrics-server:
   #   args:

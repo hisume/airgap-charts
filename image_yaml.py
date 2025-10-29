@@ -35,6 +35,15 @@ def find_images(content, public_image, private_image, chart_values, parent_keys=
     public_image_repo = public_image.split(':')[0]
     private_image_repo, private_image_tag = private_image.split(':')
 
+    # Normalize well-known alias hosts (e.g., ecr-public.aws.com -> public.ecr.aws)
+    def _normalize_host(s: str) -> str:
+        try:
+            return s.replace("ecr-public.aws.com", "public.ecr.aws")
+        except Exception:
+            return s
+
+    normalized_public_repo = _normalize_host(public_image_repo)
+
     # Split private repo into registry host and repo path (host/path:tag)
     private_registry = ""
     private_repo_path = private_image_repo
@@ -52,7 +61,7 @@ def find_images(content, public_image, private_image, chart_values, parent_keys=
     if isinstance(content, dict):
         for key, value in content.items():
             current_keys = parent_keys + [key]
-            if isinstance(value, str) and public_image_repo in value:
+            if isinstance(value, str) and normalized_public_repo in _normalize_host(value):
                 # Decide how to write overlay based on sibling keys (schema detection)
                 parent_obj = content  # dict that holds the key
                 # Case A: parent object contains registry split fields under an 'image' object
@@ -112,7 +121,7 @@ def find_images(content, public_image, private_image, chart_values, parent_keys=
                     repo_key = "repository" if "repository" in value else ("image" if "image" in value else ("name" if "name" in value else None))
                     if "registry" in value and repo_key and isinstance(value.get("registry"), str) and isinstance(value.get(repo_key), str):
                         composed_src = f"{value.get('registry')}/{value.get(repo_key)}"
-                        if composed_src == public_image_repo:
+                        if _normalize_host(composed_src) == normalized_public_repo:
                             d = _ensure_path(chart_values, current_keys[:-1])
                             payload = {}
                             payload["registry"] = private_registry or private_image_repo.split('/')[0]
@@ -124,7 +133,7 @@ def find_images(content, public_image, private_image, chart_values, parent_keys=
                     # Case B: flattened imageRegistry/imageRepository/imageTag
                     if isinstance(value.get("imageRegistry"), str) and isinstance(value.get("imageRepository"), str):
                         composed_src = f"{value.get('imageRegistry')}/{value.get('imageRepository')}"
-                        if composed_src == public_image_repo:
+                        if _normalize_host(composed_src) == normalized_public_repo:
                             d = _ensure_path(chart_values, current_keys[:-1])
                             d["imageRegistry"] = private_registry or private_image_repo.split('/')[0]
                             d["imageRepository"] = private_repo_path if private_registry else private_image_repo

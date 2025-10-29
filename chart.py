@@ -844,7 +844,23 @@ class HelmChart:
                 # Use sandboxed helm with OCI enabled for dependency operations
                 dep_build_out = self.run_helm(["dependency", "build", chart_root], "Failed to build chart dependencies")
                 if dep_build_out is None:
-                    logger.warning("Dependency build failed; skipping vendored subcharts and relying on --dependency-update during template")
+                    logger.warning("Dependency build failed; attempting 'helm dependency update'")
+                    dep_update_out = self.run_helm(["dependency", "update", chart_root], "Failed to update chart dependencies")
+                    if dep_update_out is not None:
+                        logger.info("Dependency update succeeded; retrying 'helm dependency build'")
+                        dep_build_retry = self.run_helm(["dependency", "build", chart_root], "Failed to build chart dependencies (after update)")
+                        if dep_build_retry is not None:
+                            logger.info("Dependency build succeeded after update")
+                            # Drop the earlier build failure from summary if present
+                            try:
+                                if self.failed_commands and "Failed to build chart dependencies" in str(self.failed_commands[-1][1]):
+                                    self.failed_commands.pop()
+                            except Exception:
+                                pass
+                        else:
+                            logger.warning("Dependency build still failing; relying on --dependency-update during template")
+                    else:
+                        logger.warning("Dependency update failed; will rely on --dependency-update during template")
                 # Do not force-enable conditional dependencies; honor chart defaults and external overrides
 
                 template_target = Path(chart_root)

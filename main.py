@@ -106,6 +106,13 @@ def process_helm_chart(helm_chart: HelmChart, downloaded_chart_folder: str, scan
 
 
         # Build summary status
+        # Drop benign helm dependency lock sync failures from command errors
+        if helm_chart.failed_commands:
+            helm_chart.failed_commands = [
+                fc for fc in helm_chart.failed_commands
+                if "Failed to build chart dependencies" not in str(fc[1])
+                and "Failed to build chart dependencies (after update)" not in str(fc[1])
+            ]
         error_msgs = []
         if helm_chart.failed_pull_addon_chart_images:
             error_msgs.append(f"Failed pulls: {helm_chart.failed_pull_addon_chart_images}")
@@ -141,169 +148,100 @@ def main(scan_only: bool, push_images: bool, latest: bool = False, values_path: 
     # Determine mode
     values_mode = bool(values_path) and os.path.exists(values_path)
 
-    if getattr(args, "catalog", None) and os.path.exists(args.catalog):
-        logger.info(f"Loading addons from catalog: {args.catalog}")
-        try:
-            addons = load_catalog(args.catalog)
-        except Exception as e:
-            logger.error(f"Failed to load catalog from {args.catalog}: {e}")
-            return
+    # Catalog mode: allow multiple catalog files (repeat flag or comma-separated)
+    catalog_paths = []
+    if getattr(args, "catalog", None):
+        inputs = args.catalog if isinstance(args.catalog, list) else [args.catalog]
+        for c in inputs:
+            parts = [p.strip() for p in str(c).split(",") if p.strip()]
+            catalog_paths.extend(parts)
 
-        if not addons:
-            logger.warning(f"No addons discovered in catalog {args.catalog}")
-            return
-
-        logger.info(f"Loaded {len(addons)} addons from catalog")
-        # Optional filter to process only specific addons by exact chart name
-        if getattr(args, "only_addon", None):
-            selectors = {s.strip().lower() for s in str(args.only_addon).split(",") if s.strip()}
-            if selectors:
-                before = len(addons)
-                addons = [a for a in addons if (a.get("release") or "").strip().lower() in selectors]
-                selected_names = ", ".join([a.get("release") or "" for a in addons])
-                logger.info(f"Selected {len(addons)}/{before} addons via --only-addon: {selected_names}")
-                if not addons:
-                    logger.warning("No addons matched --only-addon filter; exiting.")
-                    return
-        # Optional exclusion filter by exact chart name
-        if getattr(args, "exclude_addons", None):
-            excludes = {s.strip().lower() for s in str(args.exclude_addons).split(",") if s.strip()}
-            if excludes:
-                before = len(addons)
-                addons = [a for a in addons if (a.get("release") or "").strip().lower() not in excludes]
-                logger.info(f"Excluded {before - len(addons)} addons via --exclude-addons (by release): {', '.join(sorted(excludes))}")
-                if not addons:
-                    logger.warning("All addons excluded by --exclude-addons; exiting.")
-                    return
-        for spec in addons:
-            helm_chart = HelmChart(
-                addon_chart=spec.get('chart'),
-                addon_chart_version=spec.get('version'),
-                addon_chart_repository=spec.get('repository'),
-                addon_chart_repository_namespace=spec.get('oci_namespace') or "",
-                addon_chart_release_name=spec.get('release') or ""
-            )
-            # Attach optional ECR password overrides (CLI flags or env vars)
-            public_pw = args.public_ecr_password or os.getenv("ECR_PUBLIC_PASSWORD", "")
-            private_pw = args.private_ecr_password or os.getenv("ECR_PRIVATE_PASSWORD", "")
-            helm_chart.public_ecr_password = public_pw
-            helm_chart.private_ecr_password = private_pw
-            # Platform preference
-            helm_chart.platform = args.platform
-            # Docker Hub credentials (optional)
-            helm_chart.dockerhub_username = args.dockerhub_username or os.getenv("DOCKERHUB_USERNAME", "")
-            helm_chart.dockerhub_token = args.dockerhub_token or os.getenv("DOCKERHUB_TOKEN", "")
-
-            # If version is not specified in catalog, force pull_latest for this chart
-            pull_latest_flag = latest or (not bool(spec.get('version')))
-
-            result = process_helm_chart(
-                helm_chart=helm_chart,
-                downloaded_chart_folder=downloaded_chart_folder,
-                scan_only=scan_only,
-                push_images=push_images,
-                pull_latest_flag=pull_latest_flag,
-                target_registry=args.target_registry,
-                repository_prefix=args.target_prefix,
-                include_dependencies=args.include_dependencies,
-            )
-            if result:
-                hc, err = result
-                if hc:
-                    processed_charts.append(hc)
-                    summaries.append({
-                        "name": hc.addon_chart,
-                        "version": hc.addon_chart_version,
-                        "error": err or ""
-                    })
-                else:
-                    summaries.append({
-                        "name": spec.get('chart') or "unknown",
-                        "version": spec.get('version') or "",
-                        "error": err or "unknown error"
-                    })
-    elif False:
-        yaml_files = get_yaml_files(base_appspec_folder)
-        # Filter the specific appspec file based on the name passed as argument
-        yaml_files = [f for f in yaml_files if appspec_name in f]
-        logger.info(f"Found {len(yaml_files)} YAML files in {base_appspec_folder} matching '{appspec_name}'")
-
-        for yaml_file in yaml_files:
-            chart_info = extract_values(yaml_file)
-            if not chart_info:
-                logger.info(f"No extractable chart info in {yaml_file}")
+    if catalog_paths:
+        for catalog_path in catalog_paths:
+            if not os.path.exists(catalog_path):
+                logger.warning(f"Catalog not found: {catalog_path}; skipping.")
                 continue
-            logger.info(chart_info)
+            logger.info(f"Loading addons from catalog: {catalog_path}")
+            try:
+                addons = load_catalog(catalog_path)
+            except Exception as e:
+                logger.error(f"Failed to load catalog from {catalog_path}: {e}")
+                continue
 
-            # chart_info is a HelmChart instance already; we re-instantiate to keep a clean object
-            helm_chart = HelmChart(
-                addon_chart=chart_info.addon_chart,
-                addon_chart_version=chart_info.addon_chart_version,
-                addon_chart_repository=chart_info.addon_chart_repository,
-                addon_chart_repository_namespace=chart_info.addon_chart_repository_namespace,
-                addon_chart_release_name=chart_info.addon_chart_release_name
-            )
-            # Attach optional ECR password overrides (CLI flags or env vars)
-            public_pw = args.public_ecr_password or os.getenv("ECR_PUBLIC_PASSWORD", "")
-            private_pw = args.private_ecr_password or os.getenv("ECR_PRIVATE_PASSWORD", "")
-            helm_chart.public_ecr_password = public_pw
-            helm_chart.private_ecr_password = private_pw
-            # Platform preference
-            helm_chart.platform = args.platform
-            # Docker Hub credentials (optional)
-            helm_chart.dockerhub_username = args.dockerhub_username or os.getenv("DOCKERHUB_USERNAME", "")
-            helm_chart.dockerhub_token = args.dockerhub_token or os.getenv("DOCKERHUB_TOKEN", "")
-            # ECR skip/verify/overwrite controls
-            helm_chart.skip_existing = getattr(args, "skip_existing", True)
-            helm_chart.verify_existing_digest = getattr(args, "verify_existing_digest", False)
-            helm_chart.overwrite_existing = getattr(args, "overwrite_existing", False)
-            # ECR skip/verify/overwrite controls
-            helm_chart.skip_existing = getattr(args, "skip_existing", True)
-            helm_chart.verify_existing_digest = getattr(args, "verify_existing_digest", False)
-            helm_chart.overwrite_existing = getattr(args, "overwrite_existing", False)
-            # ECR skip/verify/overwrite controls
-            helm_chart.skip_existing = getattr(args, "skip_existing", True)
-            helm_chart.verify_existing_digest = getattr(args, "verify_existing_digest", False)
-            helm_chart.overwrite_existing = getattr(args, "overwrite_existing", False)
-            # ECR skip/verify/overwrite controls
-            helm_chart.skip_existing = getattr(args, "skip_existing", True)
-            helm_chart.verify_existing_digest = getattr(args, "verify_existing_digest", False)
-            helm_chart.overwrite_existing = getattr(args, "overwrite_existing", False)
-            # ECR preflight flags
-            helm_chart.skip_existing = getattr(args, "skip_existing", True)
-            helm_chart.verify_existing_digest = getattr(args, "verify_existing_digest", False)
-            helm_chart.overwrite_existing = getattr(args, "overwrite_existing", False)
+            if not addons:
+                logger.warning(f"No addons discovered in catalog {catalog_path}")
+                continue
 
-            # Use global latest flag as provided
-            result = process_helm_chart(
-                helm_chart=helm_chart,
-                downloaded_chart_folder=downloaded_chart_folder,
-                scan_only=scan_only,
-                push_images=push_images,
-                pull_latest_flag=latest,
-                yaml_file=yaml_file,
-                new_appspec_folder=new_appspec_folder,
-                base_appspec_folder=base_appspec_folder,
-                target_registry=args.target_registry,
-                repository_prefix=args.target_prefix,
-                include_dependencies=args.include_dependencies,
-            )
-            if result:
-                hc, err = result
-                if hc:
-                    processed_charts.append(hc)
-                    summaries.append({
-                        "name": hc.addon_chart,
-                        "version": hc.addon_chart_version,
-                        "error": err or ""
-                    })
-                else:
-                    # If no chart object, synthesize minimal summary
-                    summaries.append({
-                        "name": chart_info.addon_chart if 'chart_info' in locals() and chart_info else (appspec_name or "unknown"),
-                        "version": chart_info.addon_chart_version if 'chart_info' in locals() and chart_info else "",
-                        "error": err or "unknown error"
-                    })
+            logger.info(f"Loaded {len(addons)} addons from catalog")
+            # Optional filter to process only specific addons by exact release name (catalog mode)
+            if getattr(args, "only_addon", None):
+                selectors = {s.strip().lower() for s in str(args.only_addon).split(",") if s.strip()}
+                if selectors:
+                    before = len(addons)
+                    addons = [a for a in addons if (a.get("release") or "").strip().lower() in selectors]
+                    selected_names = ", ".join([a.get("release") or "" for a in addons])
+                    logger.info(f"Selected {len(addons)}/{before} addons via --only-addon: {selected_names}")
+                    if not addons:
+                        logger.warning("No addons matched --only-addon filter; skipping this catalog.")
+                        continue
+            # Optional exclusion filter by release name (catalog mode)
+            if getattr(args, "exclude_addons", None):
+                excludes = {s.strip().lower() for s in str(args.exclude_addons).split(",") if s.strip()}
+                if excludes:
+                    before = len(addons)
+                    addons = [a for a in addons if (a.get("release") or "").strip().lower() not in excludes]
+                    logger.info(f"Excluded {before - len(addons)} addons via --exclude-addons (by release): {', '.join(sorted(excludes))}")
+                    if not addons:
+                        logger.warning("All addons excluded by --exclude-addons for this catalog; skipping.")
+                        continue
+
+            for spec in addons:
+                helm_chart = HelmChart(
+                    addon_chart=spec.get('chart'),
+                    addon_chart_version=spec.get('version'),
+                    addon_chart_repository=spec.get('repository'),
+                    addon_chart_repository_namespace=spec.get('oci_namespace') or "",
+                    addon_chart_release_name=spec.get('release') or ""
+                )
+                # Attach optional ECR password overrides (CLI flags or env vars)
+                public_pw = args.public_ecr_password or os.getenv("ECR_PUBLIC_PASSWORD", "")
+                private_pw = args.private_ecr_password or os.getenv("ECR_PRIVATE_PASSWORD", "")
+                helm_chart.public_ecr_password = public_pw
+                helm_chart.private_ecr_password = private_pw
+                # Platform preference
+                helm_chart.platform = args.platform
+                # Docker Hub credentials (optional)
+                helm_chart.dockerhub_username = args.dockerhub_username or os.getenv("DOCKERHUB_USERNAME", "")
+                helm_chart.dockerhub_token = args.dockerhub_token or os.getenv("DOCKERHUB_TOKEN", "")
+
+                # If version is not specified in catalog, force pull_latest for this chart
+                pull_latest_flag = latest or (not bool(spec.get('version')))
+
+                result = process_helm_chart(
+                    helm_chart=helm_chart,
+                    downloaded_chart_folder=downloaded_chart_folder,
+                    scan_only=scan_only,
+                    push_images=push_images,
+                    pull_latest_flag=pull_latest_flag,
+                    target_registry=args.target_registry,
+                    repository_prefix=args.target_prefix,
+                    include_dependencies=args.include_dependencies,
+                )
+                if result:
+                    hc, err = result
+                    if hc:
+                        processed_charts.append(hc)
+                        summaries.append({
+                            "name": hc.addon_chart,
+                            "version": hc.addon_chart_version,
+                            "error": err or ""
+                        })
+                    else:
+                        summaries.append({
+                            "name": spec.get('chart') or "unknown",
+                            "version": spec.get('version') or "",
+                            "error": err or "unknown error"
+                        })
 
     elif values_mode:
         logger.info(f"Parsing addons from values file: {values_path}")
@@ -387,12 +325,13 @@ def main(scan_only: bool, push_images: bool, latest: bool = False, values_path: 
                         "error": err or "unknown error"
                     })
     else:
-        logger.error("No valid mode selected. Supply --values pointing to a values.yaml file containing addons.")
+        logger.error("No valid mode selected. Supply --catalog for catalog mode, or --values pointing to a values.yaml file containing addons.")
         return
 
     # Summary (name, version, status in green/red, error text if any)
     if summaries:
         logger.info("Summary:")
+        summaries = sorted(summaries, key=lambda s: (s.get("name") or "").lower())
     for s in summaries:
         name = s.get("name") or "unknown"
         version = s.get("version") or ""
@@ -405,7 +344,7 @@ def main(scan_only: bool, push_images: bool, latest: bool = False, values_path: 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process Helm charts and update them with new versions and image repositories.')
     parser.add_argument('--values', default='./values.yaml', help='Path to a values.yaml that lists addons (Values mode)')
-    parser.add_argument('--catalog', required=False, help='Path to a pre-built addons catalog YAML (alternate input to --values)')
+    parser.add_argument('--catalog', action='append', required=False, help='Path(s) to one or more addons catalog YAML files (repeat flag or comma-separated). Alternate input to --values')
     parser.add_argument('--latest', action='store_true', help='Flag that pulls the latest images/versions when available')
     parser.add_argument('--scan-only', action='store_true', help='Flag to only scan images and not push them')
     parser.add_argument('--push-images', action='store_true', help='Flag to push images to ECR')

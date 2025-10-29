@@ -162,11 +162,13 @@ def extract_chart_values_image(chart_image_yaml_file, public_images, private_ima
         print(f"Searching for images: {public_images}")
 
         try:
-            for public_image, private_image in zip(public_images, private_images):
-                public_image_name = public_image.split(':')[0].split('/')[-1]
-                private_image_name = private_image.split(':')[0].split('/')[-1]
-                if public_image_name == private_image_name:
-                    chart_values = find_images(content, public_image, private_image, chart_values)
+            # Build explicit mapping of public -> private by index and process all entries
+            mapping = {}
+            limit = min(len(public_images), len(private_images))
+            for i in range(limit):
+                mapping[public_images[i]] = private_images[i]
+            for pub, priv in mapping.items():
+                chart_values = find_images(content, pub, priv, chart_values)
         except Exception as e:
             logger.error(f"Error processing images: {e}")
 
